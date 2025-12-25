@@ -303,7 +303,7 @@ public class ModelIngestionService : IngestionServiceBase
     }
 
     /// <summary>
-    /// Bulk lookup/create Unicode codepoint atoms.
+    /// Bulk lookup/create Unicode codepoint constants.
     /// </summary>
     private async Task<Dictionary<uint, long>> BulkGetOrCreateCodepointsAsync(
         uint[] codepoints, CancellationToken ct)
@@ -312,16 +312,15 @@ public class ModelIngestionService : IngestionServiceBase
         var cpAsLong = codepoints.Select(c => (long)c).ToList();
 
         // Bulk lookup existing
-        var existing = await Context.Atoms
-            .Where(a => a.IsConstant && a.SeedType == SEED_TYPE_UNICODE &&
-                        a.SeedValue.HasValue && cpAsLong.Contains(a.SeedValue.Value))
-            .Select(a => new { a.Id, a.SeedValue })
+        var existing = await Context.Constants
+            .Where(c => c.SeedType == SEED_TYPE_UNICODE &&
+                        cpAsLong.Contains(c.SeedValue))
+            .Select(c => new { c.Id, c.SeedValue })
             .ToListAsync(ct);
 
-        foreach (var atom in existing)
+        foreach (var constant in existing)
         {
-            if (atom.SeedValue.HasValue)
-                result[(uint)atom.SeedValue.Value] = atom.Id;
+            result[(uint)constant.SeedValue] = constant.Id;
         }
 
         // Find missing
@@ -331,31 +330,30 @@ public class ModelIngestionService : IngestionServiceBase
         if (missing.Length == 0) return result;
 
         // Bulk create missing
-        var newAtoms = missing.AsParallel().Select(cp =>
+        var newConstants = missing.AsParallel().Select(cp =>
         {
             var hash = Native.NativeLibrary.ComputeSeedHash(cp);
             var point = Native.NativeLibrary.project_seed_to_hypersphere(cp);
             var hilbert = Native.NativeLibrary.point_to_hilbert(point);
             var geom = GeometryFactory.CreatePoint(new CoordinateZM(point.X, point.Y, point.Z, point.M));
 
-            return (cp, new Atom
+            return (cp, new Constant
             {
-                HilbertHigh = hilbert.High,
-                HilbertLow = hilbert.Low,
+                HilbertHigh = (ulong)hilbert.High,
+                HilbertLow = (ulong)hilbert.Low,
                 Geom = geom,
-                IsConstant = true,
                 SeedValue = cp,
                 SeedType = SEED_TYPE_UNICODE,
                 ContentHash = hash
             });
         }).ToList();
 
-        Context.Atoms.AddRange(newAtoms.Select(x => x.Item2));
+        Context.Constants.AddRange(newConstants.Select(x => x.Item2));
         await Context.SaveChangesAsync(ct);
 
-        foreach (var (cp, atom) in newAtoms)
+        foreach (var (cp, constant) in newConstants)
         {
-            result[cp] = atom.Id;
+            result[cp] = constant.Id;
         }
 
         return result;
@@ -370,16 +368,15 @@ public class ModelIngestionService : IngestionServiceBase
         var result = new Dictionary<uint, long>();
         var valAsLong = values.Select(v => (long)v).ToList();
 
-        var existing = await Context.Atoms
-            .Where(a => a.IsConstant && a.SeedType == SEED_TYPE_INTEGER &&
-                        a.SeedValue.HasValue && valAsLong.Contains(a.SeedValue.Value))
-            .Select(a => new { a.Id, a.SeedValue })
+        var existing = await Context.Constants
+            .Where(c => c.SeedType == SEED_TYPE_INTEGER &&
+                        valAsLong.Contains(c.SeedValue))
+            .Select(c => new { c.Id, c.SeedValue })
             .ToListAsync(ct);
 
-        foreach (var atom in existing)
+        foreach (var constant in existing)
         {
-            if (atom.SeedValue.HasValue)
-                result[(uint)atom.SeedValue.Value] = atom.Id;
+            result[(uint)constant.SeedValue] = constant.Id;
         }
 
         var existingVals = new HashSet<uint>(result.Keys);
@@ -387,31 +384,30 @@ public class ModelIngestionService : IngestionServiceBase
 
         if (missing.Length == 0) return result;
 
-        var newAtoms = missing.AsParallel().Select(val =>
+        var newConstants = missing.AsParallel().Select(val =>
         {
             var hash = Native.NativeLibrary.ComputeSeedHash(val);
             var point = Native.NativeLibrary.project_seed_to_hypersphere(val);
             var hilbert = Native.NativeLibrary.point_to_hilbert(point);
             var geom = GeometryFactory.CreatePoint(new CoordinateZM(point.X, point.Y, point.Z, point.M));
 
-            return (val, new Atom
+            return (val, new Constant
             {
-                HilbertHigh = hilbert.High,
-                HilbertLow = hilbert.Low,
+                HilbertHigh = (ulong)hilbert.High,
+                HilbertLow = (ulong)hilbert.Low,
                 Geom = geom,
-                IsConstant = true,
                 SeedValue = val,
                 SeedType = SEED_TYPE_INTEGER,
                 ContentHash = hash
             });
         }).ToList();
 
-        Context.Atoms.AddRange(newAtoms.Select(x => x.Item2));
+        Context.Constants.AddRange(newConstants.Select(x => x.Item2));
         await Context.SaveChangesAsync(ct);
 
-        foreach (var (val, atom) in newAtoms)
+        foreach (var (val, constant) in newConstants)
         {
-            result[val] = atom.Id;
+            result[val] = constant.Id;
         }
 
         return result;
@@ -452,23 +448,22 @@ public class ModelIngestionService : IngestionServiceBase
             textToHash[text] = hash;
         }
 
-        // Load composition atoms - filter by content hash matching
-        var allHashes = textToHash.Values.Select(h => h).ToList();
-        var existingCompositions = await Context.Atoms
-            .Where(a => !a.IsConstant && a.ContentHash != null)
-            .Select(a => new { a.Id, a.ContentHash })
+        // Load existing compositions by content hash
+        var existingCompositions = await Context.Compositions
+            .Where(c => c.ContentHash != null)
+            .Select(c => new { c.Id, c.ContentHash })
             .ToListAsync(ct);
 
         // Build lookup by converting byte[] to hex string for comparison
-        var hashToAtomId = existingCompositions
-            .ToDictionary(a => Convert.ToHexString(a.ContentHash), a => a.Id);
+        var hashToCompositionId = existingCompositions
+            .ToDictionary(c => Convert.ToHexString(c.ContentHash), c => c.Id);
 
         foreach (var (text, hash) in textToHash)
         {
             var hashHex = Convert.ToHexString(hash);
-            if (hashToAtomId.TryGetValue(hashHex, out var atomId))
+            if (hashToCompositionId.TryGetValue(hashHex, out var compositionId))
             {
-                result[text] = atomId;
+                result[text] = compositionId;
             }
         }
 
@@ -479,8 +474,8 @@ public class ModelIngestionService : IngestionServiceBase
 
         Logger?.LogDebug("Creating {Count} new token compositions", missingTexts.Length);
 
-        // For missing texts, we need to create atoms
-        // First ensure all codepoints exist
+        // For missing texts, we need to create compositions
+        // First ensure all codepoints exist as constants
         var allCodepoints = new HashSet<uint>();
         foreach (var text in missingTexts)
         {
@@ -498,10 +493,10 @@ public class ModelIngestionService : IngestionServiceBase
             }
         }
 
-        var cpToAtomId = await BulkGetOrCreateCodepointsAsync(allCodepoints.ToArray(), ct);
+        var cpToConstantId = await BulkGetOrCreateCodepointsAsync(allCodepoints.ToArray(), ct);
 
-        // Now create composition atoms for each missing text
-        var newCompositions = new List<(string text, Atom atom)>();
+        // Now create composition for each missing text
+        var newCompositions = new List<(string text, Composition composition, long[] constantIds, int[] mults)>();
         foreach (var text in missingTexts)
         {
             var codepoints = new List<uint>();
@@ -518,9 +513,9 @@ public class ModelIngestionService : IngestionServiceBase
                 }
             }
 
-            var refs = codepoints.Select(cp => cpToAtomId[cp]).ToArray();
-            var mults = Enumerable.Repeat(1, refs.Length).ToArray();
-            var hash = Native.NativeLibrary.ComputeCompositionHash(refs, mults);
+            var constantIds = codepoints.Select(cp => cpToConstantId[cp]).ToArray();
+            var mults = Enumerable.Repeat(1, constantIds.Length).ToArray();
+            var hash = Native.NativeLibrary.ComputeCompositionHash(constantIds, mults);
 
             // Compute geometry from first char
             var firstCp = codepoints.FirstOrDefault();
@@ -528,25 +523,34 @@ public class ModelIngestionService : IngestionServiceBase
             var hilbert = Native.NativeLibrary.point_to_hilbert(point);
             var geom = GeometryFactory.CreatePoint(new CoordinateZM(point.X, point.Y, point.Z, point.M));
 
-            newCompositions.Add((text, new Atom
+            newCompositions.Add((text, new Composition
             {
-                HilbertHigh = hilbert.High,
-                HilbertLow = hilbert.Low,
+                HilbertHigh = (ulong)hilbert.High,
+                HilbertLow = (ulong)hilbert.Low,
                 Geom = geom,
-                IsConstant = false,
-                Refs = refs,
-                Multiplicities = mults,
                 ContentHash = hash
-            }));
+            }, constantIds, mults));
         }
 
-        Context.Atoms.AddRange(newCompositions.Select(x => x.atom));
+        Context.Compositions.AddRange(newCompositions.Select(x => x.composition));
         await Context.SaveChangesAsync(ct);
 
-        foreach (var (text, atom) in newCompositions)
+        // Create Relation entries for each composition
+        foreach (var (text, composition, constantIds, mults) in newCompositions)
         {
-            result[text] = atom.Id;
+            for (int i = 0; i < constantIds.Length; i++)
+            {
+                Context.Relations.Add(new Relation
+                {
+                    CompositionId = composition.Id,
+                    ChildConstantId = constantIds[i],
+                    Position = i,
+                    Multiplicity = mults[i]
+                });
+            }
+            result[text] = composition.Id;
         }
+        await Context.SaveChangesAsync(ct);
 
         return result;
     }
@@ -632,8 +636,10 @@ public class ModelIngestionService : IngestionServiceBase
             return 0;
         }
 
+        // Trajectories are compositions, not constants
+        var children = trajectoryAtomIds.Select(id => (id, isConstant: false)).ToArray();
         var headCompositionId = await CreateCompositionAsync(
-            trajectoryAtomIds.ToArray(),
+            children,
             Enumerable.Repeat(1, trajectoryAtomIds.Count).ToArray(),
             null,
             ct);
@@ -644,82 +650,97 @@ public class ModelIngestionService : IngestionServiceBase
     }
 
     /// <summary>
-    /// Create a trajectory atom representing attention from one token to another.
+    /// Create a trajectory composition representing attention from one token to another.
     /// Stored as LINESTRING between the spatial positions of the tokens.
-    /// Structure: Refs = [from, to, weight, layer, head], Descriptors = [model_name_atom]
+    /// Structure: Refs = [from, to, weight, layer, head], Descriptors = [model_name]
     /// Enables querying by layer, head, or model.
     /// </summary>
     private async Task<long> CreateTrajectoryAsync(
-        long fromAtomId,
-        long toAtomId,
+        long fromNodeId,
+        long toNodeId,
         float weight,
         int layer,
         int head,
-        long modelNameAtomId,
+        long modelNameCompositionId,
         CancellationToken ct = default)
     {
-        // Get source and target atom geometries
-        var fromAtom = await Context.Atoms.FindAsync(new object[] { fromAtomId }, ct);
-        var toAtom = await Context.Atoms.FindAsync(new object[] { toAtomId }, ct);
+        // Get source and target geometries from Constants or Compositions
+        Geometry? fromGeom = null;
+        Geometry? toGeom = null;
+        bool fromIsConstant = false;
+        bool toIsConstant = false;
 
-        if (fromAtom?.Geom == null || toAtom?.Geom == null)
-            throw new InvalidOperationException("Source or target atom not found");
+        var fromConstant = await Context.Constants.FindAsync(new object[] { fromNodeId }, ct);
+        if (fromConstant != null)
+        {
+            fromGeom = fromConstant.Geom;
+            fromIsConstant = true;
+        }
+        else
+        {
+            var fromComposition = await Context.Compositions.FindAsync(new object[] { fromNodeId }, ct);
+            if (fromComposition != null)
+            {
+                fromGeom = fromComposition.Geom;
+            }
+        }
+
+        var toConstant = await Context.Constants.FindAsync(new object[] { toNodeId }, ct);
+        if (toConstant != null)
+        {
+            toGeom = toConstant.Geom;
+            toIsConstant = true;
+        }
+        else
+        {
+            var toComposition = await Context.Compositions.FindAsync(new object[] { toNodeId }, ct);
+            if (toComposition != null)
+            {
+                toGeom = toComposition.Geom;
+            }
+        }
+
+        if (fromGeom == null || toGeom == null)
+            throw new InvalidOperationException("Source or target node not found");
 
         // Extract coordinates
-        var fromCoord = ExtractCoordinate(fromAtom.Geom);
-        var toCoord = ExtractCoordinate(toAtom.Geom);
+        var fromCoord = ExtractCoordinate(fromGeom);
+        var toCoord = ExtractCoordinate(toGeom);
 
         // Create LINESTRING trajectory
         var trajectory = GeometryFactory.CreateLineString(new[] { fromCoord, toCoord });
 
-        // Create weight constant atom
+        // Create weight constant
         uint weightBits = BitConverter.SingleToUInt32Bits(weight);
-        var weightAtomId = await GetOrCreateConstantAsync(weightBits, SEED_TYPE_FLOAT_BITS, null, ct);
+        var weightConstantId = await GetOrCreateConstantAsync(weightBits, SEED_TYPE_FLOAT_BITS, ct);
 
-        // Create layer and head constant atoms
-        var layerAtomId = await GetOrCreateIntegerConstantAsync(layer, null, ct);
-        var headAtomId = await GetOrCreateIntegerConstantAsync(head, null, ct);
+        // Create layer and head constants
+        var layerConstantId = await GetOrCreateConstantAsync(layer, SEED_TYPE_INTEGER, ct);
+        var headConstantId = await GetOrCreateConstantAsync(head, SEED_TYPE_INTEGER, ct);
 
-        // Structure: [from, to, weight, layer, head]
-        var refs = new[] { fromAtomId, toAtomId, weightAtomId, layerAtomId, headAtomId };
-        var multiplicities = new[] { 1, 1, 1, 1, 1 };
-        var contentHash = HartNative.ComputeCompositionHash(refs, multiplicities);
-
-        // Check for existing (content-addressed deduplication)
-        var existing = await Context.Atoms
-            .Where(a => a.ContentHash == contentHash && !a.IsConstant)
-            .Select(a => a.Id)
-            .FirstOrDefaultAsync(ct);
-
-        if (existing != 0) return existing;
-
-        // Compute Hilbert index from trajectory centroid
-        var centroid = trajectory.Centroid.Coordinate;
-        var hilbert = HartNative.point_to_hilbert(new HartNative.PointZM
+        // Build children array: [from, to, weight, layer, head, model]
+        var children = new (long id, bool isConstant)[]
         {
-            X = centroid.X,
-            Y = centroid.Y,
-            Z = double.IsNaN(centroid.Z) ? 0 : centroid.Z,
-            M = double.IsNaN(centroid.M) ? 0 : centroid.M
-        });
-
-        // Trajectory: Refs = [from, to, weight, layer, head], Descriptors = [model]
-        var trajectoryAtom = new Atom
-        {
-            HilbertHigh = hilbert.High,
-            HilbertLow = hilbert.Low,
-            Geom = trajectory,
-            IsConstant = false,
-            Refs = refs,
-            Multiplicities = multiplicities,
-            ContentHash = contentHash,
-            Descriptors = new[] { modelNameAtomId }
+            (fromNodeId, fromIsConstant),
+            (toNodeId, toIsConstant),
+            (weightConstantId, true),
+            (layerConstantId, true),
+            (headConstantId, true),
+            (modelNameCompositionId, false)  // model name is a composition
         };
+        var multiplicities = new[] { 1, 1, 1, 1, 1, 1 };
 
-        Context.Atoms.Add(trajectoryAtom);
-        await Context.SaveChangesAsync(ct);
+        var compositionId = await CreateCompositionAsync(children, multiplicities, null, ct);
 
-        return trajectoryAtom.Id;
+        // Update the composition geometry to the trajectory LINESTRING
+        var composition = await Context.Compositions.FindAsync(new object[] { compositionId }, ct);
+        if (composition != null)
+        {
+            composition.Geom = trajectory;
+            await Context.SaveChangesAsync(ct);
+        }
+
+        return compositionId;
     }
 
     // ============================================
@@ -867,30 +888,30 @@ public class ModelIngestionService : IngestionServiceBase
     }
 
     private async Task<long> CreateModelCompositionAsync(
-        long[] tensorAtomIds,
+        long[] tensorCompositionIds,
         string modelName,
         SafeTensorMetadata metadata,
         CancellationToken ct)
     {
-        var multiplicities = Enumerable.Repeat(1, tensorAtomIds.Length).ToArray();
-        var contentHash = HartNative.ComputeCompositionHash(tensorAtomIds, multiplicities);
+        var multiplicities = Enumerable.Repeat(1, tensorCompositionIds.Length).ToArray();
+        var contentHash = HartNative.ComputeCompositionHash(tensorCompositionIds, multiplicities);
 
-        var existing = await Context.Atoms
-            .Where(a => a.ContentHash == contentHash && !a.IsConstant)
-            .Select(a => a.Id)
+        var existing = await Context.Compositions
+            .Where(c => c.ContentHash == contentHash)
+            .Select(c => c.Id)
             .FirstOrDefaultAsync(ct);
 
         if (existing != 0) return existing;
 
-        // Load child atoms to build geometry
-        var children = await Context.Atoms
-            .Where(a => tensorAtomIds.Contains(a.Id))
-            .ToDictionaryAsync(a => a.Id, ct);
+        // Load child compositions to build geometry
+        var children = await Context.Compositions
+            .Where(c => tensorCompositionIds.Contains(c.Id))
+            .ToDictionaryAsync(c => c.Id, ct);
 
         var coordinates = new List<CoordinateZM>();
-        foreach (var atomId in tensorAtomIds)
+        foreach (var compositionId in tensorCompositionIds)
         {
-            if (children.TryGetValue(atomId, out var child))
+            if (children.TryGetValue(compositionId, out var child))
             {
                 coordinates.Add(ExtractCoordinate(child.Geom));
             }
@@ -909,22 +930,32 @@ public class ModelIngestionService : IngestionServiceBase
             M = double.IsNaN(centroid.M) ? 0 : centroid.M
         });
 
-        // Model is composition of tensor atoms - structure is self-describing
-        var atom = new Atom
+        // Model is composition of tensor compositions
+        var composition = new Composition
         {
-            HilbertHigh = hilbert.High,
-            HilbertLow = hilbert.Low,
+            HilbertHigh = (ulong)hilbert.High,
+            HilbertLow = (ulong)hilbert.Low,
             Geom = geom,
-            IsConstant = false,
-            Refs = tensorAtomIds,
-            Multiplicities = multiplicities,
             ContentHash = contentHash
         };
 
-        Context.Atoms.Add(atom);
+        Context.Compositions.Add(composition);
         await Context.SaveChangesAsync(ct);
 
-        return atom.Id;
+        // Create Relation entries for tensor references
+        for (int i = 0; i < tensorCompositionIds.Length; i++)
+        {
+            Context.Relations.Add(new Relation
+            {
+                CompositionId = composition.Id,
+                ChildCompositionId = tensorCompositionIds[i],
+                Position = i,
+                Multiplicity = multiplicities[i]
+            });
+        }
+        await Context.SaveChangesAsync(ct);
+
+        return composition.Id;
     }
 
     /// <summary>

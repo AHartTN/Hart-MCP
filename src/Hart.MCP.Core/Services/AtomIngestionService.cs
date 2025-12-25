@@ -9,7 +9,7 @@ using System.Text;
 namespace Hart.MCP.Core.Services;
 
 /// <summary>
-/// Atom ingestion service - converts any content into atoms and persists to database
+/// Atom ingestion service - converts any content into constants/compositions and persists to database
 /// Handles: Unicode text, bytes, images, models, everything
 /// </summary>
 public class AtomIngestionService
@@ -31,9 +31,9 @@ public class AtomIngestionService
     }
 
     /// <summary>
-    /// Ingest UTF-8 text into atoms
-    /// Each Unicode codepoint becomes a constant atom
-    /// Returns root composition atom ID
+    /// Ingest UTF-8 text into constants/compositions
+    /// Each Unicode codepoint becomes a constant
+    /// Returns root composition ID
     /// </summary>
     public async Task<long> IngestTextAsync(string text, CancellationToken cancellationToken = default)
     {
@@ -64,7 +64,7 @@ public class AtomIngestionService
         // ============================================
         // PHASE 3: Build composition using lookup (no DB calls in loop)
         // ============================================
-        var atomIds = new List<long>(codepoints.Count);
+        var constantIds = new List<long>(codepoints.Count);
         var multiplicities = new List<int>(codepoints.Count);
 
         // Use RLE compression - consecutive identical codepoints get multiplicity > 1
@@ -80,22 +80,22 @@ public class AtomIngestionService
                 count++;
             }
 
-            atomIds.Add(codepointLookup[currentCodepoint]); // O(1), NO DB
+            constantIds.Add(codepointLookup[currentCodepoint]); // O(1), NO DB
             multiplicities.Add(count);
             
             i += count;
         }
 
-        // Create composition atom (root node for this text)
-        var compositionId = await CreateCompositionAsync(
-            atomIds.ToArray(),
+        // Create composition (root node for this text)
+        var compositionId = await CreateCompositionFromConstantsAsync(
+            constantIds.ToArray(),
             multiplicities.ToArray(),
-            null, // typeRef - can be set by caller if needed
+            null, // typeId - can be set by caller if needed
             cancellationToken
         );
 
-        _logger?.LogInformation("Ingested text as composition atom {AtomId} with {RefCount} references", 
-            compositionId, atomIds.Count);
+        _logger?.LogInformation("Ingested text as composition {CompositionId} with {RefCount} references", 
+            compositionId, constantIds.Count);
 
         return compositionId;
     }
@@ -113,24 +113,20 @@ public class AtomIngestionService
         // Get unique codepoints
         var uniqueCodepoints = codepoints.Distinct().ToArray();
         
-        // Convert to long for query (SeedValue is stored as long?)
+        // Convert to long for query (SeedValue is stored as long)
         var codepointsAsLong = uniqueCodepoints.Select(cp => (long)cp).ToList();
 
         // SINGLE QUERY: Get all existing constants by seed value and seedType
-        // Using SeedValue instead of ContentHash avoids byte[] comparison issues in InMemory provider
-        var existing = await _context.Atoms
-            .Where(a => a.IsConstant && a.SeedType == SEED_TYPE_UNICODE && a.SeedValue.HasValue && codepointsAsLong.Contains(a.SeedValue.Value))
-            .Select(a => new { a.Id, a.SeedValue })
+        var existing = await _context.Constants
+            .Where(c => c.SeedType == SEED_TYPE_UNICODE && codepointsAsLong.Contains(c.SeedValue))
+            .Select(c => new { c.Id, c.SeedValue })
             .ToListAsync(cancellationToken);
 
         // Map existing to result
-        foreach (var atom in existing)
+        foreach (var constant in existing)
         {
-            if (atom.SeedValue.HasValue)
-            {
-                var cp = (uint)atom.SeedValue.Value;
-                result[cp] = atom.Id;
-            }
+            var cp = (uint)constant.SeedValue;
+            result[cp] = constant.Id;
         }
 
         // Find missing codepoints
@@ -138,8 +134,8 @@ public class AtomIngestionService
         
         if (missingCodepoints.Count > 0)
         {
-            // BATCH INSERT: Create all missing atoms
-            var newAtoms = new List<(uint Codepoint, Atom Atom)>();
+            // BATCH INSERT: Create all missing constants
+            var newConstants = new List<(uint Codepoint, Constant Constant)>();
             
             foreach (var cp in missingCodepoints)
             {
@@ -148,29 +144,27 @@ public class AtomIngestionService
                 var hilbert = NativeLibrary.point_to_hilbert(point);
                 var geom = _geometryFactory.CreatePoint(new CoordinateZM(point.X, point.Y, point.Z, point.M));
 
-                var atom = new Atom
+                var constant = new Constant
                 {
-                    HilbertHigh = hilbert.High,
-                    HilbertLow = hilbert.Low,
+                    HilbertHigh = (ulong)hilbert.High,
+                    HilbertLow = (ulong)hilbert.Low,
                     Geom = geom,
-                    IsConstant = true,
                     SeedValue = cp,
                     SeedType = SEED_TYPE_UNICODE,
-                    ContentHash = contentHash,
-                    TypeRef = null // Character constants - type determined by SeedType
+                    ContentHash = contentHash
                 };
 
-                _context.Atoms.Add(atom);
-                newAtoms.Add((cp, atom));
+                _context.Constants.Add(constant);
+                newConstants.Add((cp, constant));
             }
 
-            // ONE SaveChanges for all new atoms
+            // ONE SaveChanges for all new constants
             await _context.SaveChangesAsync(cancellationToken);
 
-            // Map new atoms to result
-            foreach (var (cp, atom) in newAtoms)
+            // Map new constants to result
+            foreach (var (cp, constant) in newConstants)
             {
-                result[cp] = atom.Id;
+                result[cp] = constant.Id;
             }
         }
 
@@ -207,7 +201,7 @@ public class AtomIngestionService
     }
 
     /// <summary>
-    /// Get or create a constant atom for a Unicode codepoint
+    /// Get or create a constant for a Unicode codepoint
     /// Uses content hash for automatic deduplication
     /// </summary>
     public async Task<long> GetOrCreateConstantAsync(uint codepoint, CancellationToken cancellationToken = default)
@@ -216,9 +210,9 @@ public class AtomIngestionService
         var contentHash = NativeLibrary.ComputeSeedHash(codepoint);
 
         // Check if already exists (deduplication)
-        var existing = await _context.Atoms
-            .Where(a => a.ContentHash == contentHash && a.IsConstant)
-            .Select(a => a.Id)
+        var existing = await _context.Constants
+            .Where(c => c.ContentHash == contentHash)
+            .Select(c => c.Id)
             .FirstOrDefaultAsync(cancellationToken);
 
         if (existing != 0)
@@ -234,21 +228,17 @@ public class AtomIngestionService
         );
 
         // Insert new constant
-        var atom = new Atom
+        var constant = new Constant
         {
-            HilbertHigh = hilbert.High,
-            HilbertLow = hilbert.Low,
+            HilbertHigh = (ulong)hilbert.High,
+            HilbertLow = (ulong)hilbert.Low,
             Geom = geom,
-            IsConstant = true,
             SeedValue = codepoint,
             SeedType = SEED_TYPE_UNICODE,
-            Refs = null,
-            Multiplicities = null,
-            ContentHash = contentHash,
-            TypeRef = null // Character constants - type determined by SeedType
+            ContentHash = contentHash
         };
 
-        _context.Atoms.Add(atom);
+        _context.Constants.Add(constant);
         
         try
         {
@@ -256,12 +246,12 @@ public class AtomIngestionService
         }
         catch (DbUpdateException ex) when (IsDuplicateKeyException(ex))
         {
-            // Race condition: another process created this atom
-            _context.Entry(atom).State = EntityState.Detached;
+            // Race condition: another process created this constant
+            _context.Entry(constant).State = EntityState.Detached;
             
-            existing = await _context.Atoms
-                .Where(a => a.ContentHash == contentHash && a.IsConstant)
-                .Select(a => a.Id)
+            existing = await _context.Constants
+                .Where(c => c.ContentHash == contentHash)
+                .Select(c => c.Id)
                 .FirstOrDefaultAsync(cancellationToken);
                 
             if (existing != 0)
@@ -270,46 +260,46 @@ public class AtomIngestionService
             throw;
         }
 
-        return atom.Id;
+        return constant.Id;
     }
 
     /// <summary>
-    /// Create a composition atom from child atom IDs
+    /// Create a composition from child constant IDs
     /// </summary>
-    public async Task<long> CreateCompositionAsync(
-        long[] refs,
+    public async Task<long> CreateCompositionFromConstantsAsync(
+        long[] constantIds,
         int[] multiplicities,
-        long? typeRef = null,
+        long? typeId = null,
         CancellationToken cancellationToken = default)
     {
-        if (refs == null || refs.Length == 0)
-            throw new ArgumentException("Refs cannot be null or empty", nameof(refs));
-        if (multiplicities == null || multiplicities.Length != refs.Length)
-            throw new ArgumentException("Multiplicities must match refs length", nameof(multiplicities));
+        if (constantIds == null || constantIds.Length == 0)
+            throw new ArgumentException("ConstantIds cannot be null or empty", nameof(constantIds));
+        if (multiplicities == null || multiplicities.Length != constantIds.Length)
+            throw new ArgumentException("Multiplicities must match constantIds length", nameof(multiplicities));
 
         // Compute deterministic hash
-        var contentHash = NativeLibrary.ComputeCompositionHash(refs, multiplicities);
+        var contentHash = NativeLibrary.ComputeCompositionHash(constantIds, multiplicities);
 
         // Check if already exists (deduplication)
-        var existing = await _context.Atoms
-            .Where(a => a.ContentHash == contentHash && !a.IsConstant)
-            .Select(a => a.Id)
+        var existing = await _context.Compositions
+            .Where(c => c.ContentHash == contentHash)
+            .Select(c => c.Id)
             .FirstOrDefaultAsync(cancellationToken);
 
         if (existing != 0)
             return existing;
 
-        // Load child atoms to get their geometries
-        var children = await _context.Atoms
-            .Where(a => refs.Contains(a.Id))
-            .ToDictionaryAsync(a => a.Id, cancellationToken);
+        // Load child constants to get their geometries
+        var children = await _context.Constants
+            .Where(c => constantIds.Contains(c.Id))
+            .ToDictionaryAsync(c => c.Id, cancellationToken);
 
         // Build LINESTRING from child points (in order)
         var coordinates = new List<CoordinateZM>();
-        foreach (var refId in refs)
+        foreach (var constId in constantIds)
         {
-            if (!children.TryGetValue(refId, out var child))
-                throw new InvalidOperationException($"Referenced atom {refId} not found");
+            if (!children.TryGetValue(constId, out var child))
+                throw new InvalidOperationException($"Referenced constant {constId} not found");
 
             var coord = ExtractRepresentativeCoordinate(child.Geom);
             coordinates.Add(coord);
@@ -336,33 +326,44 @@ public class AtomIngestionService
             M = double.IsNaN(centroid.M) ? 0 : centroid.M
         });
 
-        var composition = new Atom
+        var composition = new Composition
         {
-            HilbertHigh = hilbert.High,
-            HilbertLow = hilbert.Low,
+            HilbertHigh = (ulong)hilbert.High,
+            HilbertLow = (ulong)hilbert.Low,
             Geom = geom,
-            IsConstant = false,
-            SeedValue = null,
-            SeedType = null,
-            Refs = refs,
-            Multiplicities = multiplicities,
             ContentHash = contentHash,
-            TypeRef = typeRef
+            TypeId = typeId
         };
 
-        _context.Atoms.Add(composition);
+        _context.Compositions.Add(composition);
         
         try
         {
+            await _context.SaveChangesAsync(cancellationToken);
+
+            // Create Relation entries to link to children
+            for (int i = 0; i < constantIds.Length; i++)
+            {
+                var relation = new Relation
+                {
+                    CompositionId = composition.Id,
+                    ChildConstantId = constantIds[i],
+                    ChildCompositionId = null,
+                    Position = i,
+                    Multiplicity = multiplicities[i]
+                };
+                _context.Relations.Add(relation);
+            }
+
             await _context.SaveChangesAsync(cancellationToken);
         }
         catch (DbUpdateException ex) when (IsDuplicateKeyException(ex))
         {
             _context.Entry(composition).State = EntityState.Detached;
             
-            existing = await _context.Atoms
-                .Where(a => a.ContentHash == contentHash && !a.IsConstant)
-                .Select(a => a.Id)
+            existing = await _context.Compositions
+                .Where(c => c.ContentHash == contentHash)
+                .Select(c => c.Id)
                 .FirstOrDefaultAsync(cancellationToken);
                 
             if (existing != 0)
@@ -374,8 +375,123 @@ public class AtomIngestionService
         return composition.Id;
     }
 
-    private static CoordinateZM ExtractRepresentativeCoordinate(Geometry geom)
+    /// <summary>
+    /// Create a composition from child composition IDs (for nested structures)
+    /// </summary>
+    public async Task<long> CreateCompositionFromCompositionsAsync(
+        long[] compositionIds,
+        int[] multiplicities,
+        long? typeId = null,
+        CancellationToken cancellationToken = default)
     {
+        if (compositionIds == null || compositionIds.Length == 0)
+            throw new ArgumentException("CompositionIds cannot be null or empty", nameof(compositionIds));
+        if (multiplicities == null || multiplicities.Length != compositionIds.Length)
+            throw new ArgumentException("Multiplicities must match compositionIds length", nameof(multiplicities));
+
+        // Compute deterministic hash
+        var contentHash = NativeLibrary.ComputeCompositionHash(compositionIds, multiplicities);
+
+        // Check if already exists (deduplication)
+        var existing = await _context.Compositions
+            .Where(c => c.ContentHash == contentHash)
+            .Select(c => c.Id)
+            .FirstOrDefaultAsync(cancellationToken);
+
+        if (existing != 0)
+            return existing;
+
+        // Load child compositions to get their geometries
+        var children = await _context.Compositions
+            .Where(c => compositionIds.Contains(c.Id))
+            .ToDictionaryAsync(c => c.Id, cancellationToken);
+
+        // Build LINESTRING from child centroids (in order)
+        var coordinates = new List<CoordinateZM>();
+        foreach (var compId in compositionIds)
+        {
+            if (!children.TryGetValue(compId, out var child))
+                throw new InvalidOperationException($"Referenced composition {compId} not found");
+
+            var coord = ExtractRepresentativeCoordinate(child.Geom);
+            coordinates.Add(coord);
+        }
+
+        // Create geometry
+        Geometry geom;
+        if (coordinates.Count == 1)
+        {
+            geom = _geometryFactory.CreatePoint(coordinates[0]);
+        }
+        else
+        {
+            geom = _geometryFactory.CreateLineString(coordinates.ToArray());
+        }
+
+        // Compute Hilbert index from centroid
+        var centroid = geom.Centroid.Coordinate;
+        var hilbert = NativeLibrary.point_to_hilbert(new NativeLibrary.PointZM
+        {
+            X = centroid.X,
+            Y = centroid.Y,
+            Z = double.IsNaN(centroid.Z) ? 0 : centroid.Z,
+            M = double.IsNaN(centroid.M) ? 0 : centroid.M
+        });
+
+        var composition = new Composition
+        {
+            HilbertHigh = (ulong)hilbert.High,
+            HilbertLow = (ulong)hilbert.Low,
+            Geom = geom,
+            ContentHash = contentHash,
+            TypeId = typeId
+        };
+
+        _context.Compositions.Add(composition);
+        
+        try
+        {
+            await _context.SaveChangesAsync(cancellationToken);
+
+            // Create Relation entries to link to child compositions
+            for (int i = 0; i < compositionIds.Length; i++)
+            {
+                var relation = new Relation
+                {
+                    CompositionId = composition.Id,
+                    ChildConstantId = null,
+                    ChildCompositionId = compositionIds[i],
+                    Position = i,
+                    Multiplicity = multiplicities[i]
+                };
+                _context.Relations.Add(relation);
+            }
+
+            await _context.SaveChangesAsync(cancellationToken);
+        }
+        catch (DbUpdateException ex) when (IsDuplicateKeyException(ex))
+        {
+            _context.Entry(composition).State = EntityState.Detached;
+            
+            existing = await _context.Compositions
+                .Where(c => c.ContentHash == contentHash)
+                .Select(c => c.Id)
+                .FirstOrDefaultAsync(cancellationToken);
+                
+            if (existing != 0)
+                return existing;
+                
+            throw;
+        }
+
+        return composition.Id;
+    }
+
+    private static CoordinateZM ExtractRepresentativeCoordinate(Geometry? geom)
+    {
+        if (geom == null)
+            return new CoordinateZM(0, 0, 0, 0);
+
         if (geom is Point p)
         {
             var coord = p.Coordinate;
@@ -398,51 +514,62 @@ public class AtomIngestionService
     }
 
     /// <summary>
-    /// Reconstruct text from composition atom ID
+    /// Reconstruct text from composition ID
     /// </summary>
     public async Task<string> ReconstructTextAsync(long compositionId, CancellationToken cancellationToken = default)
     {
-        var composition = await _context.Atoms
-            .Where(a => a.Id == compositionId && !a.IsConstant)
+        var composition = await _context.Compositions
+            .Where(c => c.Id == compositionId)
             .FirstOrDefaultAsync(cancellationToken);
 
         if (composition == null)
-            throw new InvalidOperationException($"Composition atom {compositionId} not found");
+            throw new InvalidOperationException($"Composition {compositionId} not found");
 
-        if (composition.Refs == null || composition.Refs.Length == 0)
+        // Get relations from Relation table ordered by position
+        var relations = await _context.Relations
+            .Where(r => r.CompositionId == compositionId)
+            .OrderBy(r => r.Position)
+            .ToListAsync(cancellationToken);
+
+        if (relations.Count == 0)
             return string.Empty;
 
-        if (composition.Multiplicities == null || composition.Multiplicities.Length != composition.Refs.Length)
-            throw new InvalidOperationException($"Composition {compositionId} has invalid multiplicities");
-
-        var refIds = composition.Refs;
-        var constants = await _context.Atoms
-            .Where(a => refIds.Contains(a.Id) && a.IsConstant)
-            .ToDictionaryAsync(a => a.Id, cancellationToken);
+        var constantIds = relations
+            .Where(r => r.ChildConstantId.HasValue)
+            .Select(r => r.ChildConstantId!.Value)
+            .Distinct()
+            .ToList();
+            
+        var constants = await _context.Constants
+            .Where(c => constantIds.Contains(c.Id))
+            .ToDictionaryAsync(c => c.Id, cancellationToken);
 
         var sb = new StringBuilder();
         
-        for (int i = 0; i < composition.Refs.Length; i++)
+        foreach (var relation in relations)
         {
-            var refId = composition.Refs[i];
-            var multiplicity = composition.Multiplicities[i];
-            
-            if (!constants.TryGetValue(refId, out var constant))
+            if (!relation.ChildConstantId.HasValue)
             {
-                _logger?.LogWarning("Referenced atom {RefId} not found during reconstruction", refId);
+                _logger?.LogWarning("Relation at position {Position} has no ChildConstantId during text reconstruction", relation.Position);
                 continue;
             }
 
-            if (constant.SeedType != SEED_TYPE_UNICODE || constant.SeedValue == null)
+            if (!constants.TryGetValue(relation.ChildConstantId.Value, out var constant))
             {
-                _logger?.LogWarning("Atom {AtomId} is not a Unicode constant", refId);
+                _logger?.LogWarning("Referenced constant {ConstId} not found during reconstruction", relation.ChildConstantId.Value);
                 continue;
             }
 
-            uint codepoint = (uint)constant.SeedValue.Value;
+            if (constant.SeedType != SEED_TYPE_UNICODE)
+            {
+                _logger?.LogWarning("Constant {ConstId} is not a Unicode constant (SeedType={SeedType})", constant.Id, constant.SeedType);
+                continue;
+            }
+
+            uint codepoint = (uint)constant.SeedValue;
             string charStr = char.ConvertFromUtf32((int)codepoint);
             
-            for (int m = 0; m < multiplicity; m++)
+            for (int m = 0; m < relation.Multiplicity; m++)
             {
                 sb.Append(charStr);
             }
@@ -452,13 +579,23 @@ public class AtomIngestionService
     }
 
     /// <summary>
-    /// Get atom by ID
+    /// Get constant by ID
     /// </summary>
-    public async Task<Atom?> GetAtomAsync(long atomId, CancellationToken cancellationToken = default)
+    public async Task<Constant?> GetConstantAsync(long constantId, CancellationToken cancellationToken = default)
     {
-        return await _context.Atoms
+        return await _context.Constants
             .AsNoTracking()
-            .FirstOrDefaultAsync(a => a.Id == atomId, cancellationToken);
+            .FirstOrDefaultAsync(c => c.Id == constantId, cancellationToken);
+    }
+
+    /// <summary>
+    /// Get composition by ID
+    /// </summary>
+    public async Task<Composition?> GetCompositionAsync(long compositionId, CancellationToken cancellationToken = default)
+    {
+        return await _context.Compositions
+            .AsNoTracking()
+            .FirstOrDefaultAsync(c => c.Id == compositionId, cancellationToken);
     }
 
     private static bool IsDuplicateKeyException(DbUpdateException ex)

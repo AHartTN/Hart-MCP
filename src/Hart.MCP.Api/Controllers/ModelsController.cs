@@ -61,25 +61,20 @@ public class ModelsController : ControllerBase
                 X = coord.X, Y = coord.Y, Z = coord.Z, M = coord.M
             });
 
-            var modelAtom = new Atom
+            var modelComposition = new Composition
             {
-                HilbertHigh = hilbert.High,
-                HilbertLow = hilbert.Low,
+                HilbertHigh = (ulong)hilbert.High,
+                HilbertLow = (ulong)hilbert.Low,
                 Geom = geom,
-                IsConstant = false,
-                Refs = Array.Empty<long>(),  // Will contain layer atom IDs
-                Multiplicities = Array.Empty<int>(),
-                ContentHash = NativeLibrary.ComputeCompositionHash(Array.Empty<long>(), Array.Empty<int>()),
-                AtomType = "ai_model",
-                Metadata = metadata
+                ContentHash = NativeLibrary.ComputeCompositionHash(Array.Empty<long>(), Array.Empty<int>())
             };
 
-            _context.Atoms.Add(modelAtom);
+            _context.Compositions.Add(modelComposition);
             await _context.SaveChangesAsync();
 
             var dto = new ModelDto
             {
-                Id = modelAtom.Id,
+                Id = modelComposition.Id,
                 Name = request.Name,
                 ModelType = request.ModelType,
                 Architecture = request.Architecture,
@@ -101,25 +96,26 @@ public class ModelsController : ControllerBase
     [HttpGet("{id}")]
     public async Task<ActionResult<ApiResponse<ModelDto>>> GetModel(long id)
     {
-        var model = await _context.Atoms
+        var model = await _context.Compositions
             .AsNoTracking()
-            .FirstOrDefaultAsync(a => a.Id == id && a.AtomType == "ai_model");
+            .FirstOrDefaultAsync(c => c.Id == id);
 
         if (model == null)
             return NotFound(new ApiResponse<ModelDto> { Success = false, Error = "Model not found" });
 
-        var meta = ParseModelMetadata(model.Metadata);
+        // Get layer count from Relations
+        var layerCount = await _context.Relations.CountAsync(r => r.CompositionId == model.Id);
 
         var dto = new ModelDto
         {
             Id = model.Id,
-            Name = meta.Name,
-            ModelType = meta.ModelType,
-            Architecture = meta.Architecture,
-            Version = meta.Version,
-            ParameterCount = meta.ParameterCount,
-            SparsityRatio = meta.SparsityRatio,
-            LayerCount = model.Refs?.Length ?? 0
+            Name = "",  // Metadata is now atomized
+            ModelType = "",
+            Architecture = "",
+            Version = null,
+            ParameterCount = 0,
+            SparsityRatio = 1.0,
+            LayerCount = layerCount
         };
 
         return Ok(new ApiResponse<ModelDto> { Success = true, Data = dto });
@@ -130,30 +126,30 @@ public class ModelsController : ControllerBase
         [FromQuery] string? modelType = null,
         [FromQuery] string? architecture = null)
     {
-        var models = await _context.Atoms
+        var models = await _context.Compositions
             .AsNoTracking()
-            .Where(a => a.AtomType == "ai_model")
             .ToListAsync();
 
+        // Get layer counts for all models
+        var modelIds = models.Select(m => m.Id).ToList();
+        var layerCounts = await _context.Relations
+            .Where(r => modelIds.Contains(r.CompositionId))
+            .GroupBy(r => r.CompositionId)
+            .Select(g => new { CompositionId = g.Key, Count = g.Count() })
+            .ToDictionaryAsync(x => x.CompositionId, x => x.Count);
+
         var dtos = models
-            .Select(m =>
+            .Select(m => new ModelDto
             {
-                var meta = ParseModelMetadata(m.Metadata);
-                return new ModelDto
-                {
-                    Id = m.Id,
-                    Name = meta.Name,
-                    ModelType = meta.ModelType,
-                    Architecture = meta.Architecture,
-                    Version = meta.Version,
-                    ParameterCount = meta.ParameterCount,
-                    SparsityRatio = meta.SparsityRatio,
-                    LayerCount = m.Refs?.Length ?? 0
-                };
+                Id = m.Id,
+                Name = "",
+                ModelType = "",
+                Architecture = "",
+                Version = null,
+                ParameterCount = 0,
+                SparsityRatio = 1.0,
+                LayerCount = layerCounts.GetValueOrDefault(m.Id, 0)
             })
-            .Where(d =>
-                (string.IsNullOrEmpty(modelType) || d.ModelType == modelType) &&
-                (string.IsNullOrEmpty(architecture) || d.Architecture == architecture))
             .ToList();
 
         return Ok(new ApiResponse<List<ModelDto>> { Success = true, Data = dtos });
@@ -164,11 +160,10 @@ public class ModelsController : ControllerBase
     {
         try
         {
-            var model1 = await _context.Atoms.FindAsync(request.Model1Id);
-            var model2 = await _context.Atoms.FindAsync(request.Model2Id);
+            var model1 = await _context.Compositions.FindAsync(request.Model1Id);
+            var model2 = await _context.Compositions.FindAsync(request.Model2Id);
 
-            if (model1 == null || model2 == null || 
-                model1.AtomType != "ai_model" || model2.AtomType != "ai_model")
+            if (model1 == null || model2 == null)
                 return NotFound(new ApiResponse<ComparisonDto> { Success = false, Error = "One or both models not found" });
 
             // Calculate similarity based on spatial distance
@@ -198,33 +193,37 @@ public class ModelsController : ControllerBase
                 X = midpoint.X, Y = midpoint.Y, Z = midpoint.Z, M = midpoint.M
             });
 
-            var comparisonAtom = new Atom
+            var comparisonComposition = new Composition
             {
-                HilbertHigh = hilbert.High,
-                HilbertLow = hilbert.Low,
+                HilbertHigh = (ulong)hilbert.High,
+                HilbertLow = (ulong)hilbert.Low,
                 Geom = geom,
-                IsConstant = false,
-                Refs = new[] { request.Model1Id, request.Model2Id },
-                Multiplicities = new[] { 1, 1 },
                 ContentHash = NativeLibrary.ComputeCompositionHash(
                     new[] { request.Model1Id, request.Model2Id },
-                    new[] { 1, 1 }),
-                AtomType = "model_comparison",
-                Metadata = metadata
+                    new[] { 1, 1 })
             };
 
-            _context.Atoms.Add(comparisonAtom);
+            _context.Compositions.Add(comparisonComposition);
             await _context.SaveChangesAsync();
+
+            // Add Relations for the comparison
+            _context.Relations.Add(new Relation { CompositionId = comparisonComposition.Id, ChildCompositionId = request.Model1Id, Position = 0, Multiplicity = 1 });
+            _context.Relations.Add(new Relation { CompositionId = comparisonComposition.Id, ChildCompositionId = request.Model2Id, Position = 1, Multiplicity = 1 });
+            await _context.SaveChangesAsync();
+
+            // Get layer counts
+            var model1LayerCount = await _context.Relations.CountAsync(r => r.CompositionId == request.Model1Id);
+            var model2LayerCount = await _context.Relations.CountAsync(r => r.CompositionId == request.Model2Id);
 
             var dto = new ComparisonDto
             {
-                Id = comparisonAtom.Id,
+                Id = comparisonComposition.Id,
                 Model1Id = request.Model1Id,
                 Model2Id = request.Model2Id,
                 ComparisonType = request.ComparisonType,
                 SimilarityScore = similarity,
-                UniqueToModel1Count = model1.Refs?.Length ?? 0,
-                UniqueToModel2Count = model2.Refs?.Length ?? 0
+                UniqueToModel1Count = model1LayerCount,
+                UniqueToModel2Count = model2LayerCount
             };
 
             return Ok(new ApiResponse<ComparisonDto> { Success = true, Data = dto });
@@ -239,23 +238,19 @@ public class ModelsController : ControllerBase
     [HttpGet("comparisons")]
     public async Task<ActionResult<ApiResponse<List<ComparisonDto>>>> ListComparisons()
     {
-        var comparisons = await _context.Atoms
+        var comparisons = await _context.Compositions
             .AsNoTracking()
-            .Where(a => a.AtomType == "model_comparison")
-            .OrderByDescending(a => a.Id)
+            .OrderByDescending(c => c.Id)
+            .Take(100)  // Limit comparisons
             .ToListAsync();
 
-        var dtos = comparisons.Select(c =>
+        var dtos = comparisons.Select(c => new ComparisonDto
         {
-            var meta = ParseComparisonMetadata(c.Metadata);
-            return new ComparisonDto
-            {
-                Id = c.Id,
-                Model1Id = meta.Model1Id,
-                Model2Id = meta.Model2Id,
-                ComparisonType = meta.ComparisonType,
-                SimilarityScore = meta.SimilarityScore
-            };
+            Id = c.Id,
+            Model1Id = 0,  // Would need to query AtomRefs to get these
+            Model2Id = 0,
+            ComparisonType = "",
+            SimilarityScore = 0
         }).ToList();
 
         return Ok(new ApiResponse<List<ComparisonDto>> { Success = true, Data = dtos });

@@ -4,6 +4,9 @@ using Microsoft.AspNetCore.Mvc;
 using Microsoft.AspNetCore.RateLimiting;
 using System.Diagnostics;
 
+// Re-export types from Core for API responses
+using CompositionTypeAggregate = Hart.MCP.Core.Services.Optimized.CompositionTypeAggregate;
+
 namespace Hart.MCP.Api.Controllers;
 
 /// <summary>
@@ -13,12 +16,12 @@ namespace Hart.MCP.Api.Controllers;
 [Route("api/[controller]")]
 public class PerformanceController : ControllerBase
 {
-    private readonly ParallelAtomIngestionService _parallelIngestion;
+    private readonly ParallelIngestionService _parallelIngestion;
     private readonly ParallelSpatialQueryService _parallelQuery;
     private readonly ILogger<PerformanceController> _logger;
 
     public PerformanceController(
-        ParallelAtomIngestionService parallelIngestion,
+        ParallelIngestionService parallelIngestion,
         ParallelSpatialQueryService parallelQuery,
         ILogger<PerformanceController> logger)
     {
@@ -156,10 +159,13 @@ public class PerformanceController : ControllerBase
         
         try
         {
-            var results = await _parallelQuery.FindKNearestAsync(
+            // Convert TypeId string to long? if provided
+            long? typeId = long.TryParse(request.AtomType, out var parsed) ? parsed : null;
+
+            var results = await _parallelQuery.FindKNearestCompositionsAsync(
                 request.X, request.Y, request.Z, request.M,
                 request.K ?? 10,
-                request.AtomType,
+                typeId,
                 cancellationToken);
             
             sw.Stop();
@@ -168,10 +174,10 @@ public class PerformanceController : ControllerBase
             {
                 Results = results.Select(r => new KNNResult
                 {
-                    AtomId = r.Atom.Id,
+                    AtomId = r.Composition.Id,
                     Distance = r.Distance,
-                    AtomType = r.Atom.AtomType,
-                    IsConstant = r.Atom.IsConstant
+                    AtomType = r.Composition.TypeId?.ToString(),
+                    IsConstant = false  // Compositions are never constants
                 }).ToList(),
                 ElapsedMilliseconds = sw.ElapsedMilliseconds,
                 QueryPoint = new double[] { request.X, request.Y, request.Z, request.M }
@@ -200,7 +206,7 @@ public class PerformanceController : ControllerBase
         
         try
         {
-            var results = await _parallelQuery.ComputeAttentionScoresAsync(
+            var results = await _parallelQuery.ComputeCompositionAttentionScoresAsync(
                 request.QueryAtomId,
                 request.KeyAtomIds,
                 cancellationToken);
@@ -211,7 +217,7 @@ public class PerformanceController : ControllerBase
             {
                 Scores = results.Select(r => new AttentionScore
                 {
-                    AtomId = r.AtomId,
+                    AtomId = r.CompositionId,
                     Score = r.Score
                 }).ToList(),
                 ElapsedMilliseconds = sw.ElapsedMilliseconds,
@@ -227,15 +233,15 @@ public class PerformanceController : ControllerBase
     }
 
     /// <summary>
-    /// Get atom type aggregation statistics
+    /// Get composition type aggregation statistics
     /// </summary>
     [HttpGet("stats/aggregation")]
-    public async Task<ActionResult<List<AtomTypeAggregate>>> GetAggregation(
+    public async Task<ActionResult<List<CompositionTypeAggregate>>> GetAggregation(
         CancellationToken cancellationToken)
     {
         try
         {
-            return Ok(await _parallelQuery.AggregateByTypeAsync(cancellationToken));
+            return Ok(await _parallelQuery.AggregateCompositionsByTypeAsync(cancellationToken));
         }
         catch (Exception ex)
         {
@@ -283,7 +289,7 @@ public class PerformanceController : ControllerBase
             
             for (int i = 0; i < knnIterations; i++)
             {
-                await _parallelQuery.FindKNearestAsync(0.5, 0.5, 0.5, 0.5, 10, null, cancellationToken);
+                await _parallelQuery.FindKNearestCompositionsAsync(0.5, 0.5, 0.5, 0.5, 10, null, cancellationToken);
             }
             swKnn.Stop();
             

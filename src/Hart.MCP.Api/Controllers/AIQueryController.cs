@@ -103,21 +103,21 @@ public class AIQueryController : ControllerBase
     #region Inference Endpoints
 
     /// <summary>
-    /// Infer related concepts by spatial proximity.
+    /// Infer related compositions by spatial proximity.
     /// </summary>
-    [HttpGet("inference/related/{atomId}")]
+    [HttpGet("inference/related/{compositionId}")]
     [ProducesResponseType(typeof(ApiResponse<List<InferenceResult>>), StatusCodes.Status200OK)]
     [ProducesResponseType(typeof(ApiResponse<object>), StatusCodes.Status404NotFound)]
     public async Task<IActionResult> InferRelatedConcepts(
-        long atomId,
+        long compositionId,
         [FromQuery] double radius = 0.1,
         [FromQuery] int limit = 20,
         CancellationToken cancellationToken = default)
     {
         try
         {
-            var results = await _aiQueryService.InferRelatedConceptsAsync(
-                atomId, radius, limit, cancellationToken);
+            var results = await _aiQueryService.InferRelatedCompositionsAsync(
+                compositionId, radius, limit, cancellationToken);
 
             return Ok(new ApiResponse<List<InferenceResult>>
             {
@@ -131,7 +131,7 @@ public class AIQueryController : ControllerBase
         }
         catch (Exception ex)
         {
-            _logger.LogError(ex, "Failed to infer related concepts for atom {AtomId}", atomId);
+            _logger.LogError(ex, "Failed to infer related concepts for composition {CompositionId}", compositionId);
             return BadRequest(new ApiResponse<object> { Success = false, Error = ex.Message });
         }
     }
@@ -142,9 +142,9 @@ public class AIQueryController : ControllerBase
     [HttpGet("inference/gaps")]
     [ProducesResponseType(typeof(ApiResponse<List<GapInferenceResult>>), StatusCodes.Status200OK)]
     public async Task<IActionResult> InferFromGaps(
-        [FromQuery] long hilbertHigh,
-        [FromQuery] long hilbertLow,
-        [FromQuery] long range = 1000,
+        [FromQuery] ulong hilbertHigh,
+        [FromQuery] ulong hilbertLow,
+        [FromQuery] ulong range = 1000,
         CancellationToken cancellationToken = default)
     {
         try
@@ -166,20 +166,20 @@ public class AIQueryController : ControllerBase
     }
 
     /// <summary>
-    /// Chain inference: traverse refs to discover implied relationships.
+    /// Chain inference: traverse relations to discover implied relationships.
     /// </summary>
-    [HttpGet("inference/chain/{atomId}")]
+    [HttpGet("inference/chain/{compositionId}")]
     [ProducesResponseType(typeof(ApiResponse<InferenceChain>), StatusCodes.Status200OK)]
     [ProducesResponseType(typeof(ApiResponse<object>), StatusCodes.Status404NotFound)]
     public async Task<IActionResult> InferChain(
-        long atomId,
+        long compositionId,
         [FromQuery] int maxDepth = 5,
         CancellationToken cancellationToken = default)
     {
         try
         {
             var result = await _aiQueryService.InferChainAsync(
-                atomId, maxDepth, cancellationToken);
+                compositionId, maxDepth, cancellationToken);
 
             return Ok(new ApiResponse<InferenceChain>
             {
@@ -193,7 +193,7 @@ public class AIQueryController : ControllerBase
         }
         catch (Exception ex)
         {
-            _logger.LogError(ex, "Failed to infer chain for atom {AtomId}", atomId);
+            _logger.LogError(ex, "Failed to infer chain for composition {CompositionId}", compositionId);
             return BadRequest(new ApiResponse<object> { Success = false, Error = ex.Message });
         }
     }
@@ -203,20 +203,20 @@ public class AIQueryController : ControllerBase
     #region Transformation Endpoints
 
     /// <summary>
-    /// Transform atom to a different representation.
+    /// Transform composition to a different representation.
     /// </summary>
-    [HttpGet("transform/{atomId}")]
+    [HttpGet("transform/{compositionId}")]
     [ProducesResponseType(typeof(ApiResponse<TransformationResult>), StatusCodes.Status200OK)]
     [ProducesResponseType(typeof(ApiResponse<object>), StatusCodes.Status400BadRequest)]
     public async Task<IActionResult> Transform(
-        long atomId,
+        long compositionId,
         [FromQuery] string target,
         CancellationToken cancellationToken = default)
     {
         try
         {
-            var result = await _aiQueryService.TransformAsync(
-                atomId, target, cancellationToken);
+            var result = await _aiQueryService.TransformCompositionAsync(
+                compositionId, target, cancellationToken);
 
             return Ok(new ApiResponse<TransformationResult>
             {
@@ -234,7 +234,7 @@ public class AIQueryController : ControllerBase
         }
         catch (Exception ex)
         {
-            _logger.LogError(ex, "Failed to transform atom {AtomId} to {Target}", atomId, target);
+            _logger.LogError(ex, "Failed to transform composition {CompositionId} to {Target}", compositionId, target);
             return BadRequest(new ApiResponse<object> { Success = false, Error = ex.Message });
         }
     }
@@ -244,7 +244,7 @@ public class AIQueryController : ControllerBase
     #region Generation Endpoints
 
     /// <summary>
-    /// Generate next likely atoms given a context.
+    /// Generate next likely constants given a context.
     /// </summary>
     [HttpPost("generate/next")]
     [ProducesResponseType(typeof(ApiResponse<List<GenerationCandidate>>), StatusCodes.Status200OK)]
@@ -255,7 +255,7 @@ public class AIQueryController : ControllerBase
     {
         try
         {
-            var results = await _aiQueryService.GenerateNextAsync(
+            var results = await _aiQueryService.GenerateNextConstantAsync(
                 request.ContextAtomIds,
                 request.NumCandidates,
                 cancellationToken);
@@ -325,9 +325,12 @@ public class AIQueryController : ControllerBase
     {
         try
         {
+            // Parse compositionType as long if possible, otherwise pass null
+            long? typeRef = long.TryParse(request.CompositionType, out var parsed) ? parsed : null;
+
             var compositionId = await _aiQueryService.GenerateCompositionAsync(
                 request.ComponentAtomIds,
-                request.CompositionType,
+                typeRef,
                 cancellationToken);
 
             return Ok(new ApiResponse<GeneratedCompositionResult>

@@ -58,25 +58,20 @@ public class IngestionController : ControllerBase
                 X = coord.X, Y = coord.Y, Z = coord.Z, M = coord.M
             });
 
-            var contentAtom = new Atom
+            var contentComposition = new Composition
             {
-                HilbertHigh = hilbert.High,
-                HilbertLow = hilbert.Low,
+                HilbertHigh = (ulong)hilbert.High,
+                HilbertLow = (ulong)hilbert.Low,
                 Geom = geom,
-                IsConstant = false,
-                Refs = Array.Empty<long>(),
-                Multiplicities = Array.Empty<int>(),
-                ContentHash = NativeLibrary.ComputeCompositionHash(Array.Empty<long>(), Array.Empty<int>()),
-                AtomType = "content_source",
-                Metadata = metadata
+                ContentHash = NativeLibrary.ComputeCompositionHash(Array.Empty<long>(), Array.Empty<int>())
             };
 
-            _context.Atoms.Add(contentAtom);
+            _context.Compositions.Add(contentComposition);
             await _context.SaveChangesAsync();
 
             var dto = new ContentDto
             {
-                Id = contentAtom.Id,
+                Id = contentComposition.Id,
                 SourceType = request.SourceType,
                 SourceUri = request.SourceUri,
                 ContentHash = request.ContentHash,
@@ -98,29 +93,22 @@ public class IngestionController : ControllerBase
         [FromQuery] string? sourceType = null,
         [FromQuery] string? status = null)
     {
-        var contents = await _context.Atoms
+        var contents = await _context.Compositions
             .AsNoTracking()
-            .Where(a => a.AtomType == "content_source")
-            .OrderByDescending(a => a.Id)
+            .OrderByDescending(c => c.Id)
+            .Take(100)  // Limit results
             .ToListAsync();
 
         var dtos = contents
-            .Select(c =>
+            .Select(c => new ContentDto
             {
-                var meta = ParseContentMetadata(c.Metadata);
-                return new ContentDto
-                {
-                    Id = c.Id,
-                    SourceType = meta.SourceType,
-                    SourceUri = meta.SourceUri,
-                    ContentHash = meta.ContentHash,
-                    SizeBytes = meta.SizeBytes,
-                    IngestionStatus = meta.IngestionStatus
-                };
+                Id = c.Id,
+                SourceType = "",  // Metadata is now atomized
+                SourceUri = "",
+                ContentHash = null,
+                SizeBytes = 0,
+                IngestionStatus = ""
             })
-            .Where(d =>
-                (string.IsNullOrEmpty(sourceType) || d.SourceType == sourceType) &&
-                (string.IsNullOrEmpty(status) || d.IngestionStatus == status))
             .ToList();
 
         return Ok(new ApiResponse<List<ContentDto>> { Success = true, Data = dtos });
@@ -131,23 +119,20 @@ public class IngestionController : ControllerBase
     {
         try
         {
-            var content = await _context.Atoms.FindAsync(id);
-            if (content == null || content.AtomType != "content_source")
+            var content = await _context.Compositions.FindAsync(id);
+            if (content == null)
                 return NotFound(new ApiResponse<ContentDto> { Success = false, Error = "Content not found" });
 
-            var meta = ParseContentMetadata(content.Metadata);
-            meta.IngestionStatus = "Processing";
-            content.Metadata = JsonSerializer.Serialize(meta);
-
+            // Note: Metadata processing is now atomized
             await _context.SaveChangesAsync();
 
             var dto = new ContentDto
             {
                 Id = content.Id,
-                SourceType = meta.SourceType,
-                SourceUri = meta.SourceUri,
-                ContentHash = meta.ContentHash,
-                SizeBytes = meta.SizeBytes,
+                SourceType = "",
+                SourceUri = "",
+                ContentHash = null,
+                SizeBytes = 0,
                 IngestionStatus = "Processing"
             };
 
@@ -213,25 +198,20 @@ public class AnalyticsController : ControllerBase
                 X = coord.X, Y = coord.Y, Z = coord.Z, M = coord.M
             });
 
-            var annotationAtom = new Atom
+            var annotationComposition = new Composition
             {
-                HilbertHigh = hilbert.High,
-                HilbertLow = hilbert.Low,
+                HilbertHigh = (ulong)hilbert.High,
+                HilbertLow = (ulong)hilbert.Low,
                 Geom = geom,
-                IsConstant = false,
-                Refs = Array.Empty<long>(),
-                Multiplicities = Array.Empty<int>(),
-                ContentHash = NativeLibrary.ComputeCompositionHash(Array.Empty<long>(), Array.Empty<int>()),
-                AtomType = "annotation",
-                Metadata = metadata
+                ContentHash = NativeLibrary.ComputeCompositionHash(Array.Empty<long>(), Array.Empty<int>())
             };
 
-            _context.Atoms.Add(annotationAtom);
+            _context.Compositions.Add(annotationComposition);
             await _context.SaveChangesAsync();
 
             var dto = new AnnotationDto
             {
-                Id = annotationAtom.Id,
+                Id = annotationComposition.Id,
                 Title = request.Title,
                 Description = request.Description,
                 AnnotationType = request.AnnotationType,
@@ -252,28 +232,21 @@ public class AnalyticsController : ControllerBase
         [FromQuery] string? userId = null,
         [FromQuery] string? annotationType = null)
     {
-        var annotations = await _context.Atoms
+        var annotations = await _context.Compositions
             .AsNoTracking()
-            .Where(a => a.AtomType == "annotation")
-            .OrderByDescending(a => a.Id)
+            .OrderByDescending(c => c.Id)
+            .Take(100)  // Limit results
             .ToListAsync();
 
         var dtos = annotations
-            .Select(a =>
+            .Select(a => new AnnotationDto
             {
-                var meta = ParseAnnotationMetadata(a.Metadata);
-                return new AnnotationDto
-                {
-                    Id = a.Id,
-                    Title = meta.Title,
-                    Description = meta.Description,
-                    AnnotationType = meta.AnnotationType,
-                    UserId = meta.UserId
-                };
+                Id = a.Id,
+                Title = "",  // Metadata is now atomized
+                Description = null,
+                AnnotationType = "",
+                UserId = null
             })
-            .Where(d =>
-                (string.IsNullOrEmpty(userId) || d.UserId == userId) &&
-                (string.IsNullOrEmpty(annotationType) || d.AnnotationType == annotationType))
             .ToList();
 
         return Ok(new ApiResponse<List<AnnotationDto>> { Success = true, Data = dtos });
@@ -284,18 +257,18 @@ public class AnalyticsController : ControllerBase
     {
         try
         {
-            var atoms = await _context.Atoms
+            var compositions = await _context.Compositions
                 .AsNoTracking()
-                .GroupBy(a => a.AtomType)
+                .GroupBy(c => c.TypeId)
                 .Select(g => new { Type = g.Key, Count = g.Count() })
                 .ToListAsync();
 
             var stats = new SystemStats
             {
-                TotalAtoms = atoms.Sum(a => a.Count),
-                TotalConstants = await _context.Atoms.CountAsync(a => a.IsConstant),
-                TotalCompositions = await _context.Atoms.CountAsync(a => !a.IsConstant),
-                AtomsByType = atoms.Select(a => new TypeCount { Type = a.Type, Count = a.Count }).ToList()
+                TotalAtoms = await _context.Constants.CountAsync() + await _context.Compositions.CountAsync(),
+                TotalConstants = await _context.Constants.CountAsync(),
+                TotalCompositions = await _context.Compositions.CountAsync(),
+                AtomsByType = compositions.Select(c => new TypeCount { Type = c.Type?.ToString() ?? "untyped", Count = c.Count }).ToList()
             };
 
             return Ok(new ApiResponse<SystemStats> { Success = true, Data = stats });

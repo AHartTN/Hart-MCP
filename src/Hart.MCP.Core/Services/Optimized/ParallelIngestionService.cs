@@ -10,20 +10,20 @@ using NetTopologySuite.Geometries;
 namespace Hart.MCP.Core.Services.Optimized;
 
 /// <summary>
-/// High-performance atom ingestion service with parallel processing,
+/// High-performance ingestion service with parallel processing,
 /// batching, and pipelining for maximum throughput.
 /// 
 /// Performance characteristics:
-/// - Batch inserts (100-1000 atoms per transaction)
+/// - Batch inserts (100-1000 constants per transaction)
 /// - Parallel hash computation
 /// - Connection pooling (100 connections)
 /// - Lock-free deduplication cache
 /// </summary>
-public sealed class ParallelAtomIngestionService : IAsyncDisposable
+public sealed class ParallelIngestionService : IAsyncDisposable
 {
     private readonly IDbContextFactory<HartDbContext> _contextFactory;
     private readonly GeometryFactory _geometryFactory;
-    private readonly ILogger<ParallelAtomIngestionService>? _logger;
+    private readonly ILogger<ParallelIngestionService>? _logger;
     
     // Configuration
     private readonly int _batchSize;
@@ -32,7 +32,7 @@ public sealed class ParallelAtomIngestionService : IAsyncDisposable
     // Performance infrastructure
     private readonly ConcurrentDictionary<string, long> _hashCache;
     private readonly AsyncSemaphore _dbSemaphore;
-    private readonly ObjectPool<List<Atom>> _listPool;
+    private readonly ObjectPool<List<Constant>> _constantListPool;
 
     private const int SEED_TYPE_UNICODE = 0;
     private const int SEED_TYPE_INTEGER = 1;
@@ -41,9 +41,9 @@ public sealed class ParallelAtomIngestionService : IAsyncDisposable
     private const int DEFAULT_MAX_PARALLELISM = 8;
     private const int MAX_CACHE_SIZE = 100_000;
 
-    public ParallelAtomIngestionService(
+    public ParallelIngestionService(
         IDbContextFactory<HartDbContext> contextFactory,
-        ILogger<ParallelAtomIngestionService>? logger = null,
+        ILogger<ParallelIngestionService>? logger = null,
         int batchSize = DEFAULT_BATCH_SIZE,
         int maxParallelism = DEFAULT_MAX_PARALLELISM)
     {
@@ -55,19 +55,19 @@ public sealed class ParallelAtomIngestionService : IAsyncDisposable
         _geometryFactory = new GeometryFactory(new PrecisionModel(), 0);
         _hashCache = new ConcurrentDictionary<string, long>();
         _dbSemaphore = new AsyncSemaphore(_maxParallelism, _maxParallelism);
-        _listPool = new ObjectPool<List<Atom>>(
-            () => new List<Atom>(_batchSize),
+        _constantListPool = new ObjectPool<List<Constant>>(
+            () => new List<Constant>(_batchSize),
             list => list.Clear(),
             maxSize: _maxParallelism * 2);
     }
 
     /// <summary>
     /// Ingest large text with parallel processing
-    /// Returns composition atom ID
+    /// Returns composition ID
     /// </summary>
     public async Task<long> IngestTextParallelAsync(
         string text,
-        string atomType = "text",
+        string compositionType = "text",
         CancellationToken cancellationToken = default)
     {
         if (string.IsNullOrEmpty(text))
@@ -81,23 +81,22 @@ public sealed class ParallelAtomIngestionService : IAsyncDisposable
         _logger?.LogDebug("Extracted {Count} codepoints in {Ms}ms", codepoints.Count, sw.ElapsedMilliseconds);
 
         // Phase 2: RLE compression
-        var (uniqueCodepoints, atomIds, multiplicities) = await CompressAndMapCodepointsAsync(
+        var (uniqueCodepoints, constantIds, multiplicities) = await CompressAndMapCodepointsAsync(
             codepoints, cancellationToken);
         _logger?.LogDebug("RLE compression: {Original} -> {Compressed} in {Ms}ms", 
-            codepoints.Count, atomIds.Count, sw.ElapsedMilliseconds);
+            codepoints.Count, constantIds.Count, sw.ElapsedMilliseconds);
 
         // Phase 3: Ensure constants exist (parallel batched)
         await EnsureConstantsExistParallelAsync(uniqueCodepoints, cancellationToken);
         _logger?.LogDebug("Constants ensured in {Ms}ms", sw.ElapsedMilliseconds);
 
         // Phase 4: Resolve IDs
-        var resolvedIds = await ResolveAtomIdsAsync(atomIds, cancellationToken);
+        var resolvedIds = await ResolveConstantIdsAsync(constantIds, cancellationToken);
         
         // Phase 5: Create composition
         var compositionId = await CreateCompositionAsync(
             resolvedIds,
             multiplicities.ToArray(),
-            atomType,
             cancellationToken);
 
         sw.Stop();
@@ -114,7 +113,7 @@ public sealed class ParallelAtomIngestionService : IAsyncDisposable
     /// </summary>
     public async Task<long[]> IngestTextsParallelAsync(
         string[] texts,
-        string atomType = "text",
+        string compositionType = "text",
         CancellationToken cancellationToken = default)
     {
         var sw = Stopwatch.StartNew();
@@ -132,7 +131,7 @@ public sealed class ParallelAtomIngestionService : IAsyncDisposable
             },
             async (i, ct) =>
             {
-                tasks[i] = IngestTextParallelAsync(texts[i], atomType, ct);
+                tasks[i] = IngestTextParallelAsync(texts[i], compositionType, ct);
                 await tasks[i];
             });
 
@@ -250,7 +249,7 @@ public sealed class ParallelAtomIngestionService : IAsyncDisposable
     }
 
     /// <summary>
-    /// Ensure all constant atoms exist in database (parallel batched)
+    /// Ensure all constants exist in database (parallel batched)
     /// </summary>
     private async Task EnsureConstantsExistParallelAsync(
         HashSet<uint> codepoints,
@@ -300,10 +299,10 @@ public sealed class ParallelAtomIngestionService : IAsyncDisposable
             .Select(h => Convert.FromHexString(h))
             .ToList();
 
-        var existing = await context.Atoms
+        var existing = await context.Constants
             .AsNoTracking()
-            .Where(a => a.IsConstant && hashBytes.Contains(a.ContentHash))
-            .Select(a => new { a.Id, Hash = Convert.ToHexString(a.ContentHash) })
+            .Where(c => hashBytes.Contains(c.ContentHash))
+            .Select(c => new { c.Id, Hash = Convert.ToHexString(c.ContentHash) })
             .ToListAsync(cancellationToken);
 
         // Cache existing
@@ -316,8 +315,8 @@ public sealed class ParallelAtomIngestionService : IAsyncDisposable
         if (hashToCodepoint.Count == 0)
             return;
 
-        // Create new atoms for missing codepoints
-        var atomList = _listPool.Rent();
+        // Create new constants for missing codepoints
+        var constantList = _constantListPool.Rent();
         try
         {
             foreach (var (hash, cp) in hashToCodepoint)
@@ -326,29 +325,27 @@ public sealed class ParallelAtomIngestionService : IAsyncDisposable
                 var hilbert = NativeLibrary.point_to_hilbert(point);
                 var geom = _geometryFactory.CreatePoint(new CoordinateZM(point.X, point.Y, point.Z, point.M));
 
-                atomList.Add(new Atom
+                constantList.Add(new Constant
                 {
-                    HilbertHigh = hilbert.High,
-                    HilbertLow = hilbert.Low,
+                    HilbertHigh = (ulong)hilbert.High,
+                    HilbertLow = (ulong)hilbert.Low,
                     Geom = geom,
-                    IsConstant = true,
                     SeedValue = cp,
                     SeedType = SEED_TYPE_UNICODE,
-                    ContentHash = Convert.FromHexString(hash),
-                    AtomType = "char"
+                    ContentHash = Convert.FromHexString(hash)
                 });
             }
 
-            context.Atoms.AddRange(atomList);
+            context.Constants.AddRange(constantList);
             
             try
             {
                 await context.SaveChangesAsync(cancellationToken);
                 
-                // Cache newly created atoms
-                foreach (var atom in atomList)
+                // Cache newly created constants
+                foreach (var constant in constantList)
                 {
-                    TryAddToCache(Convert.ToHexString(atom.ContentHash), atom.Id);
+                    TryAddToCache(Convert.ToHexString(constant.ContentHash), constant.Id);
                 }
             }
             catch (DbUpdateException ex) when (IsDuplicateKeyException(ex))
@@ -358,10 +355,10 @@ public sealed class ParallelAtomIngestionService : IAsyncDisposable
                 
                 context.ChangeTracker.Clear();
                 
-                var refetch = await context.Atoms
+                var refetch = await context.Constants
                     .AsNoTracking()
-                    .Where(a => a.IsConstant && hashBytes.Contains(a.ContentHash))
-                    .Select(a => new { a.Id, Hash = Convert.ToHexString(a.ContentHash) })
+                    .Where(c => hashBytes.Contains(c.ContentHash))
+                    .Select(c => new { c.Id, Hash = Convert.ToHexString(c.ContentHash) })
                     .ToListAsync(cancellationToken);
                 
                 foreach (var e in refetch)
@@ -370,11 +367,11 @@ public sealed class ParallelAtomIngestionService : IAsyncDisposable
         }
         finally
         {
-            _listPool.Return(atomList);
+            _constantListPool.Return(constantList);
         }
     }
 
-    private async Task<long[]> ResolveAtomIdsAsync(
+    private async Task<long[]> ResolveConstantIdsAsync(
         List<string> hashes,
         CancellationToken cancellationToken)
     {
@@ -403,10 +400,10 @@ public sealed class ParallelAtomIngestionService : IAsyncDisposable
         using var semLock = await _dbSemaphore.WaitAsync(cancellationToken);
         await using var context = await _contextFactory.CreateDbContextAsync(cancellationToken);
 
-        var fetched = await context.Atoms
+        var fetched = await context.Constants
             .AsNoTracking()
-            .Where(a => unresolvedHashes.Contains(a.ContentHash))
-            .Select(a => new { a.Id, Hash = Convert.ToHexString(a.ContentHash) })
+            .Where(c => unresolvedHashes.Contains(c.ContentHash))
+            .Select(c => new { c.Id, Hash = Convert.ToHexString(c.ContentHash) })
             .ToListAsync(cancellationToken);
 
         var hashToId = fetched.ToDictionary(f => f.Hash, f => f.Id);
@@ -423,7 +420,7 @@ public sealed class ParallelAtomIngestionService : IAsyncDisposable
             }
             else
             {
-                throw new InvalidOperationException($"Failed to resolve atom hash: {hash}");
+                throw new InvalidOperationException($"Failed to resolve constant hash: {hash}");
             }
         }
 
@@ -431,12 +428,11 @@ public sealed class ParallelAtomIngestionService : IAsyncDisposable
     }
 
     private async Task<long> CreateCompositionAsync(
-        long[] refs,
+        long[] childConstantIds,
         int[] multiplicities,
-        string atomType,
         CancellationToken cancellationToken)
     {
-        var contentHash = NativeLibrary.ComputeCompositionHash(refs, multiplicities);
+        var contentHash = NativeLibrary.ComputeCompositionHash(childConstantIds, multiplicities);
         var hashHex = Convert.ToHexString(contentHash);
 
         // Check cache
@@ -447,9 +443,9 @@ public sealed class ParallelAtomIngestionService : IAsyncDisposable
         await using var context = await _contextFactory.CreateDbContextAsync(cancellationToken);
 
         // Check database
-        var existing = await context.Atoms
-            .Where(a => a.ContentHash == contentHash && !a.IsConstant)
-            .Select(a => a.Id)
+        var existing = await context.Compositions
+            .Where(c => c.ContentHash == contentHash)
+            .Select(c => c.Id)
             .FirstOrDefaultAsync(cancellationToken);
 
         if (existing != 0)
@@ -458,15 +454,15 @@ public sealed class ParallelAtomIngestionService : IAsyncDisposable
             return existing;
         }
 
-        // Load child geometries
-        var children = await context.Atoms
+        // Load child geometries from Constants table
+        var children = await context.Constants
             .AsNoTracking()
-            .Where(a => refs.Contains(a.Id))
-            .ToDictionaryAsync(a => a.Id, cancellationToken);
+            .Where(c => childConstantIds.Contains(c.Id))
+            .ToDictionaryAsync(c => c.Id, cancellationToken);
 
         // Build geometry
-        var coords = refs
-            .Select(id => children[id].Geom.Coordinate)
+        var coords = childConstantIds
+            .Select(id => children[id].Geom!.Coordinate)
             .Select(c => new CoordinateZM(c.X, c.Y, double.IsNaN(c.Z) ? 0 : c.Z, double.IsNaN(c.M) ? 0 : c.M))
             .ToArray();
 
@@ -483,23 +479,34 @@ public sealed class ParallelAtomIngestionService : IAsyncDisposable
             M = double.IsNaN(centroid.M) ? 0 : centroid.M
         });
 
-        var composition = new Atom
+        var composition = new Composition
         {
-            HilbertHigh = hilbert.High,
-            HilbertLow = hilbert.Low,
+            HilbertHigh = (ulong)hilbert.High,
+            HilbertLow = (ulong)hilbert.Low,
             Geom = geom,
-            IsConstant = false,
-            Refs = refs,
-            Multiplicities = multiplicities,
-            ContentHash = contentHash,
-            AtomType = atomType
+            ContentHash = contentHash
         };
 
-        context.Atoms.Add(composition);
+        context.Compositions.Add(composition);
 
         try
         {
             await context.SaveChangesAsync(cancellationToken);
+
+            // Create Relation entries for composition edges
+            for (int i = 0; i < childConstantIds.Length; i++)
+            {
+                context.Relations.Add(new Relation
+                {
+                    CompositionId = composition.Id,
+                    ChildConstantId = childConstantIds[i],
+                    ChildCompositionId = null,
+                    Position = i,
+                    Multiplicity = multiplicities[i]
+                });
+            }
+            await context.SaveChangesAsync(cancellationToken);
+
             TryAddToCache(hashHex, composition.Id);
             return composition.Id;
         }
@@ -507,9 +514,9 @@ public sealed class ParallelAtomIngestionService : IAsyncDisposable
         {
             context.ChangeTracker.Clear();
             
-            existing = await context.Atoms
-                .Where(a => a.ContentHash == contentHash && !a.IsConstant)
-                .Select(a => a.Id)
+            existing = await context.Compositions
+                .Where(c => c.ContentHash == contentHash)
+                .Select(c => c.Id)
                 .FirstOrDefaultAsync(cancellationToken);
             
             if (existing != 0)

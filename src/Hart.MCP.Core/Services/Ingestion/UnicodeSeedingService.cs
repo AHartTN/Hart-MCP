@@ -48,14 +48,14 @@ public class UnicodeSeedingService
     public async Task<bool> IsSeedededAsync(CancellationToken ct = default)
     {
         // Check for presence of a few key codepoints
-        var hasAscii = await _context.Atoms
-            .AnyAsync(a => a.IsConstant && a.SeedType == 0 && a.SeedValue == 'A', ct);
+        var hasAscii = await _context.Constants
+            .AnyAsync(c => c.SeedType == 0 && c.SeedValue == 'A', ct);
         
         if (!hasAscii) return false;
         
         // Check for max unicode
-        var hasMaxUnicode = await _context.Atoms
-            .AnyAsync(a => a.IsConstant && a.SeedType == 0 && a.SeedValue == MAX_UNICODE, ct);
+        var hasMaxUnicode = await _context.Constants
+            .AnyAsync(c => c.SeedType == 0 && c.SeedValue == MAX_UNICODE, ct);
             
         return hasMaxUnicode;
     }
@@ -75,8 +75,8 @@ public class UnicodeSeedingService
         {
             _logger?.LogInformation("Unicode already seeded, skipping");
             result.WasAlreadySeeded = true;
-            result.TotalCodepoints = await _context.Atoms
-                .CountAsync(a => a.IsConstant && a.SeedType == 0, ct);
+            result.TotalCodepoints = await _context.Constants
+                .CountAsync(c => c.SeedType == 0, ct);
             return result;
         }
 
@@ -93,20 +93,20 @@ public class UnicodeSeedingService
 
             var batchSw = Stopwatch.StartNew();
 
-            // Generate atoms for this batch (parallel computation)
-            var atoms = GenerateUnicodeAtomsBatch(batchStart, batchEnd);
+            // Generate constants for this batch (parallel computation)
+            var constants = GenerateUnicodeConstantsBatch(batchStart, batchEnd);
 
             // Bulk insert
-            _context.Atoms.AddRange(atoms);
+            _context.Constants.AddRange(constants);
             await _context.SaveChangesAsync(ct);
 
-            seeded += atoms.Count;
+            seeded += constants.Count;
             batchSw.Stop();
 
-            var rate = atoms.Count * 1000.0 / batchSw.ElapsedMilliseconds;
+            var rate = constants.Count * 1000.0 / batchSw.ElapsedMilliseconds;
             _logger?.LogDebug(
-                "Batch {Start:X6}-{End:X6}: {Count:N0} atoms in {Time}ms ({Rate:N0}/sec)",
-                batchStart, batchEnd, atoms.Count, batchSw.ElapsedMilliseconds, rate);
+                "Batch {Start:X6}-{End:X6}: {Count:N0} constants in {Time}ms ({Rate:N0}/sec)",
+                batchStart, batchEnd, constants.Count, batchSw.ElapsedMilliseconds, rate);
 
             progress?.Report(new UnicodeSeedProgress
             {
@@ -131,13 +131,13 @@ public class UnicodeSeedingService
     }
 
     /// <summary>
-    /// Generate atoms for a range of Unicode codepoints.
+    /// Generate constants for a range of Unicode codepoints.
     /// Uses parallel processing for geometry computation.
     /// </summary>
-    private List<Atom> GenerateUnicodeAtomsBatch(int start, int end)
+    private List<Constant> GenerateUnicodeConstantsBatch(int start, int end)
     {
         var count = end - start + 1;
-        var atoms = new Atom[count];
+        var constants = new Constant[count];
 
         // Parallel computation of geometry (CPU-bound, perfect for parallel)
         Parallel.For(0, count, i =>
@@ -153,20 +153,18 @@ public class UnicodeSeedingService
             var geom = _geometryFactory.CreatePoint(
                 new CoordinateZM(point.X, point.Y, point.Z, point.M));
 
-            atoms[i] = new Atom
+            constants[i] = new Constant
             {
-                HilbertHigh = hilbert.High,
-                HilbertLow = hilbert.Low,
+                HilbertHigh = (ulong)hilbert.High,
+                HilbertLow = (ulong)hilbert.Low,
                 Geom = geom,
-                IsConstant = true,
                 SeedValue = codepoint,
                 SeedType = 0, // SEED_TYPE_UNICODE
-                ContentHash = contentHash,
-                AtomType = "unicode"
+                ContentHash = contentHash
             };
         });
 
-        return atoms.ToList();
+        return constants.ToList();
     }
 
     /// <summary>
@@ -174,10 +172,10 @@ public class UnicodeSeedingService
     /// </summary>
     public async Task<int> SeedAsciiOnlyAsync(CancellationToken ct = default)
     {
-        var atoms = GenerateUnicodeAtomsBatch(0, 127);
-        _context.Atoms.AddRange(atoms);
+        var constants = GenerateUnicodeConstantsBatch(0, 127);
+        _context.Constants.AddRange(constants);
         await _context.SaveChangesAsync(ct);
-        return atoms.Count;
+        return constants.Count;
     }
 
     /// <summary>
@@ -195,12 +193,12 @@ public class UnicodeSeedingService
             ct.ThrowIfCancellationRequested();
 
             var batchEnd = Math.Min(batchStart + BATCH_SIZE - 1, BMP_MAX);
-            var atoms = GenerateUnicodeAtomsBatch(batchStart, batchEnd);
+            var constants = GenerateUnicodeConstantsBatch(batchStart, batchEnd);
 
-            _context.Atoms.AddRange(atoms);
+            _context.Constants.AddRange(constants);
             await _context.SaveChangesAsync(ct);
 
-            seeded += atoms.Count;
+            seeded += constants.Count;
 
             progress?.Report(new UnicodeSeedProgress
             {

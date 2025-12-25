@@ -1,5 +1,6 @@
 using FluentAssertions;
 using Hart.MCP.Core.Data;
+using Hart.MCP.Core.Entities;
 using Hart.MCP.Core.Services.Ingestion;
 using Microsoft.EntityFrameworkCore;
 using Xunit;
@@ -90,14 +91,28 @@ public class IngestionPipelineTests
 
         reconstructed.Pixels.Should().Equal(pixels);
 
-        // Verify compression: should have far fewer atom refs than pixels
-        var rowComposition = await context.Atoms
-            .Where(a => a.AtomType == "image_row" && a.Refs != null)
-            .FirstOrDefaultAsync();
-
-        rowComposition.Should().NotBeNull();
-        // RLE: 100 identical pixels → 1 ref with multiplicity 100
-        rowComposition!.Refs!.Length.Should().Be(1);
+        // Verify compression: should have far fewer relations than pixels
+        // Find row compositions
+        var rowCompositions = await context.Compositions.ToListAsync();
+        
+        // Check that at least one composition has RLE compression
+        var hasCompressedRow = false;
+        foreach (var comp in rowCompositions)
+        {
+            var refCount = await context.Relations.CountAsync(r => r.CompositionId == comp.Id);
+            if (refCount == 1)
+            {
+                // RLE: 100 identical pixels → 1 ref with multiplicity 100
+                var relation = await context.Relations.FirstAsync(r => r.CompositionId == comp.Id);
+                if (relation.Multiplicity == 100)
+                {
+                    hasCompressedRow = true;
+                    break;
+                }
+            }
+        }
+        
+        hasCompressedRow.Should().BeTrue("RLE should compress 100 identical pixels to 1 ref with multiplicity 100");
     }
 
     #endregion
@@ -160,9 +175,9 @@ public class IngestionPipelineTests
         await service.IngestAsync(data1);
         await service.IngestAsync(data2);
 
-        // Count byte constants (0-255 only)
-        var byteConstants = await context.Atoms
-            .Where(a => a.AtomType == "constant" && a.SeedValue >= 0 && a.SeedValue < 256)
+        // Count byte constants (0-255 only) - use SeedValue range
+        var byteConstants = await context.Constants
+            .Where(c => c.SeedValue >= 0 && c.SeedValue < 256)
             .CountAsync();
 
         // Should only have constants for bytes we used (0, 1, 2)

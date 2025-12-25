@@ -12,7 +12,7 @@ namespace Hart.MCP.Core.Services;
 /// operations on the spatial knowledge substrate.
 /// 
 /// Key insight: Storage IS the model. Query IS inference. PostGIS = semantic operations.
-/// All content is atoms with AtomType discrimination and JSONB metadata.
+/// Uses Constants (leaf nodes), Compositions (internal nodes), and Relations (edges).
 /// </summary>
 public class AIQueryService
 {
@@ -32,38 +32,38 @@ public class AIQueryService
     #region Attention Queries - Find what the system "attends to"
 
     /// <summary>
-    /// Compute attention weights between a query and a set of key atoms.
+    /// Compute attention weights between a query constant and a set of key constants.
     /// Uses spatial distance as inverse attention weight.
     /// </summary>
     public async Task<List<AttentionResult>> ComputeAttentionAsync(
-        long queryAtomId,
-        IEnumerable<long> keyAtomIds,
+        long queryConstantId,
+        IEnumerable<long> keyConstantIds,
         CancellationToken cancellationToken = default)
     {
-        var queryAtom = await _context.Atoms
+        var queryConstant = await _context.Constants
             .AsNoTracking()
-            .FirstOrDefaultAsync(a => a.Id == queryAtomId, cancellationToken);
+            .FirstOrDefaultAsync(c => c.Id == queryConstantId, cancellationToken);
 
-        if (queryAtom == null)
-            throw new InvalidOperationException($"Query atom {queryAtomId} not found");
+        if (queryConstant == null)
+            throw new InvalidOperationException($"Query constant {queryConstantId} not found");
 
-        var keyIds = keyAtomIds.ToList();
-        var keyAtoms = await _context.Atoms
+        var keyIds = keyConstantIds.ToList();
+        var keyConstants = await _context.Constants
             .AsNoTracking()
-            .Where(a => keyIds.Contains(a.Id))
+            .Where(c => keyIds.Contains(c.Id))
             .ToListAsync(cancellationToken);
 
         var results = new List<AttentionResult>();
         double totalWeight = 0;
 
-        foreach (var key in keyAtoms)
+        foreach (var key in keyConstants)
         {
-            double distance = queryAtom.Geom.Distance(key.Geom);
+            double distance = queryConstant.Geom!.Distance(key.Geom!);
             double rawWeight = 1.0 / (1.0 + distance); // Inverse distance
             totalWeight += rawWeight;
             results.Add(new AttentionResult
             {
-                KeyAtomId = key.Id,
+                KeyNodeId = key.Id,
                 RawWeight = rawWeight,
                 Distance = distance
             });
@@ -83,26 +83,26 @@ public class AIQueryService
     /// Each "head" uses a different dimensional projection
     /// </summary>
     public async Task<MultiHeadAttentionResult> ComputeMultiHeadAttentionAsync(
-        long queryAtomId,
-        IEnumerable<long> keyAtomIds,
+        long queryConstantId,
+        IEnumerable<long> keyConstantIds,
         int numHeads = 4,
         CancellationToken cancellationToken = default)
     {
-        var queryAtom = await _context.Atoms
+        var queryConstant = await _context.Constants
             .AsNoTracking()
-            .FirstOrDefaultAsync(a => a.Id == queryAtomId, cancellationToken);
+            .FirstOrDefaultAsync(c => c.Id == queryConstantId, cancellationToken);
 
-        if (queryAtom == null)
-            throw new InvalidOperationException($"Query atom {queryAtomId} not found");
+        if (queryConstant == null)
+            throw new InvalidOperationException($"Query constant {queryConstantId} not found");
 
-        var keyIds = keyAtomIds.ToList();
-        var keyAtoms = await _context.Atoms
+        var keyIds = keyConstantIds.ToList();
+        var keyConstants = await _context.Constants
             .AsNoTracking()
-            .Where(a => keyIds.Contains(a.Id))
+            .Where(c => keyIds.Contains(c.Id))
             .ToListAsync(cancellationToken);
 
         var heads = new List<List<AttentionResult>>();
-        var queryCoord = queryAtom.Geom.Coordinate;
+        var queryCoord = queryConstant.Geom!.Coordinate;
 
         for (int h = 0; h < numHeads; h++)
         {
@@ -110,16 +110,16 @@ public class AIQueryService
             double totalWeight = 0;
 
             // Each head projects to different 2D subspace of the 4D space
-            foreach (var key in keyAtoms)
+            foreach (var key in keyConstants)
             {
-                var keyCoord = key.Geom.Coordinate;
+                var keyCoord = key.Geom!.Coordinate;
                 double distance = ComputeHeadDistance(queryCoord, keyCoord, h, numHeads);
                 double rawWeight = 1.0 / (1.0 + distance);
                 totalWeight += rawWeight;
 
                 headResults.Add(new AttentionResult
                 {
-                    KeyAtomId = key.Id,
+                    KeyNodeId = key.Id,
                     RawWeight = rawWeight,
                     Distance = distance
                 });
@@ -140,9 +140,9 @@ public class AIQueryService
         {
             foreach (var result in head)
             {
-                if (!aggregated.ContainsKey(result.KeyAtomId))
-                    aggregated[result.KeyAtomId] = 0;
-                aggregated[result.KeyAtomId] += result.NormalizedWeight;
+                if (!aggregated.ContainsKey(result.KeyNodeId))
+                    aggregated[result.KeyNodeId] = 0;
+                aggregated[result.KeyNodeId] += result.NormalizedWeight;
             }
         }
 
@@ -150,7 +150,7 @@ public class AIQueryService
         var totalAgg = aggregated.Values.Sum();
         var finalResults = aggregated.Select(kvp => new AttentionResult
         {
-            KeyAtomId = kvp.Key,
+            KeyNodeId = kvp.Key,
             NormalizedWeight = totalAgg > 0 ? kvp.Value / totalAgg : 0,
             RawWeight = kvp.Value,
             Distance = 0 // Aggregated, no single distance
@@ -196,60 +196,94 @@ public class AIQueryService
     #region Inference Queries - Derive knowledge from spatial relationships
 
     /// <summary>
-    /// Infer related concepts by spatial proximity.
+    /// Infer related constants by spatial proximity.
     /// "What is semantically near this content?"
     /// </summary>
-    public async Task<List<InferenceResult>> InferRelatedConceptsAsync(
-        long atomId,
+    public async Task<List<InferenceResult>> InferRelatedConstantsAsync(
+        long constantId,
         double radius = 0.1,
         int limit = 20,
         CancellationToken cancellationToken = default)
     {
-        var atom = await _context.Atoms
+        var constant = await _context.Constants
             .AsNoTracking()
-            .FirstOrDefaultAsync(a => a.Id == atomId, cancellationToken);
+            .FirstOrDefaultAsync(c => c.Id == constantId, cancellationToken);
 
-        if (atom == null)
-            throw new InvalidOperationException($"Atom {atomId} not found");
+        if (constant == null)
+            throw new InvalidOperationException($"Constant {constantId} not found");
 
-        _logger?.LogDebug("Inferring concepts within radius {Radius} of atom {AtomId}", radius, atomId);
+        _logger?.LogDebug("Inferring constants within radius {Radius} of constant {ConstantId}", radius, constantId);
 
         // Use PostGIS ST_DWithin for efficient spatial query
-        var nearby = await _context.Atoms
+        var nearby = await _context.Constants
             .AsNoTracking()
-            .Where(a => a.Id != atomId && a.Geom.IsWithinDistance(atom.Geom, radius))
-            .OrderBy(a => a.Geom.Distance(atom.Geom))
+            .Where(c => c.Id != constantId && c.Geom!.IsWithinDistance(constant.Geom!, radius))
+            .OrderBy(c => c.Geom!.Distance(constant.Geom!))
             .Take(limit)
             .ToListAsync(cancellationToken);
 
         return nearby.Select(n => new InferenceResult
         {
-            AtomId = n.Id,
-            Confidence = 1.0 / (1.0 + n.Geom.Distance(atom.Geom)),
-            RelationType = DetermineRelationType(atom, n),
-            AtomType = n.AtomType,
-            IsConstant = n.IsConstant
+            NodeId = n.Id,
+            Confidence = 1.0 / (1.0 + n.Geom!.Distance(constant.Geom!)),
+            RelationType = "semantic_neighbor",
+            IsConstant = true
         }).ToList();
     }
 
     /// <summary>
-    /// Infer missing connections using Hilbert gap analysis.
+    /// Infer related compositions by spatial proximity.
+    /// </summary>
+    public async Task<List<InferenceResult>> InferRelatedCompositionsAsync(
+        long compositionId,
+        double radius = 0.1,
+        int limit = 20,
+        CancellationToken cancellationToken = default)
+    {
+        var composition = await _context.Compositions
+            .AsNoTracking()
+            .FirstOrDefaultAsync(c => c.Id == compositionId, cancellationToken);
+
+        if (composition == null)
+            throw new InvalidOperationException($"Composition {compositionId} not found");
+
+        _logger?.LogDebug("Inferring compositions within radius {Radius} of composition {CompositionId}", radius, compositionId);
+
+        var nearby = await _context.Compositions
+            .AsNoTracking()
+            .Where(c => c.Id != compositionId && c.Geom!.IsWithinDistance(composition.Geom!, radius))
+            .OrderBy(c => c.Geom!.Distance(composition.Geom!))
+            .Take(limit)
+            .ToListAsync(cancellationToken);
+
+        return nearby.Select(n => new InferenceResult
+        {
+            NodeId = n.Id,
+            Confidence = 1.0 / (1.0 + n.Geom!.Distance(composition.Geom!)),
+            RelationType = "composition_similarity",
+            TypeId = n.TypeId,
+            IsConstant = false
+        }).ToList();
+    }
+
+    /// <summary>
+    /// Infer missing connections using Hilbert gap analysis on constants.
     /// "What should exist in this region but doesn't?"
     /// </summary>
     public async Task<List<GapInferenceResult>> InferFromGapsAsync(
-        long hilbertHigh,
-        long hilbertLow,
-        long range = 1000,
+        ulong hilbertHigh,
+        ulong hilbertLow,
+        ulong range = 1000,
         CancellationToken cancellationToken = default)
     {
         _logger?.LogDebug("Analyzing gaps near Hilbert index [{High}:{Low}]", hilbertHigh, hilbertLow);
 
-        // Find atoms in range
-        var neighbors = await _context.Atoms
+        // Find constants in range
+        var neighbors = await _context.Constants
             .AsNoTracking()
-            .Where(a => a.HilbertHigh >= hilbertHigh - 1 && a.HilbertHigh <= hilbertHigh + 1)
-            .OrderBy(a => a.HilbertHigh)
-            .ThenBy(a => a.HilbertLow)
+            .Where(c => c.HilbertHigh >= hilbertHigh - 1 && c.HilbertHigh <= hilbertHigh + 1)
+            .OrderBy(c => c.HilbertHigh)
+            .ThenBy(c => c.HilbertLow)
             .Take(100)
             .ToListAsync(cancellationToken);
 
@@ -262,14 +296,14 @@ public class AIQueryService
             var next = neighbors[i + 1];
 
             // Calculate gap size
-            long gapSize = 0;
+            ulong gapSize = 0;
             if (current.HilbertHigh == next.HilbertHigh)
             {
                 gapSize = next.HilbertLow - current.HilbertLow;
             }
             else
             {
-                gapSize = long.MaxValue; // Large gap
+                gapSize = ulong.MaxValue; // Large gap
             }
 
             // If gap is significant, infer potential content
@@ -278,16 +312,16 @@ public class AIQueryService
                 // Calculate midpoint coordinates
                 var midpoint = new NativeLibrary.PointZM
                 {
-                    X = (current.Geom.Coordinate.X + next.Geom.Coordinate.X) / 2,
-                    Y = (current.Geom.Coordinate.Y + next.Geom.Coordinate.Y) / 2,
-                    Z = (current.Geom.Coordinate.Z + next.Geom.Coordinate.Z) / 2,
-                    M = (current.Geom.Coordinate.M + next.Geom.Coordinate.M) / 2
+                    X = (current.Geom!.Coordinate.X + next.Geom!.Coordinate.X) / 2,
+                    Y = (current.Geom!.Coordinate.Y + next.Geom!.Coordinate.Y) / 2,
+                    Z = (current.Geom!.Coordinate.Z + next.Geom!.Coordinate.Z) / 2,
+                    M = (current.Geom!.Coordinate.M + next.Geom!.Coordinate.M) / 2
                 };
 
                 results.Add(new GapInferenceResult
                 {
-                    GapStartAtomId = current.Id,
-                    GapEndAtomId = next.Id,
+                    GapStartNodeId = current.Id,
+                    GapEndNodeId = next.Id,
                     GapSize = gapSize,
                     PredictedX = midpoint.X,
                     PredictedY = midpoint.Y,
@@ -302,75 +336,82 @@ public class AIQueryService
     }
 
     /// <summary>
-    /// Chain inference: follow composition refs to derive implications.
+    /// Chain inference: follow composition relations to derive implications.
     /// "If A references B which references C, what does this imply about A and C?"
     /// </summary>
     public async Task<InferenceChain> InferChainAsync(
-        long rootAtomId,
+        long rootCompositionId,
         int maxDepth = 5,
         CancellationToken cancellationToken = default)
     {
         var visited = new HashSet<long>();
-        var chain = new InferenceChain { RootAtomId = rootAtomId };
+        var chain = new InferenceChain { RootNodeId = rootCompositionId };
 
-        await TraverseChainAsync(rootAtomId, 0, maxDepth, visited, chain, cancellationToken);
+        await TraverseChainAsync(rootCompositionId, 0, maxDepth, visited, chain, cancellationToken);
 
         return chain;
     }
 
     private async Task TraverseChainAsync(
-        long atomId,
+        long compositionId,
         int depth,
         int maxDepth,
         HashSet<long> visited,
         InferenceChain chain,
         CancellationToken cancellationToken)
     {
-        if (depth >= maxDepth || visited.Contains(atomId))
+        if (depth >= maxDepth || visited.Contains(compositionId))
             return;
 
-        visited.Add(atomId);
+        visited.Add(compositionId);
 
-        var atom = await _context.Atoms
+        var composition = await _context.Compositions
             .AsNoTracking()
-            .FirstOrDefaultAsync(a => a.Id == atomId, cancellationToken);
+            .FirstOrDefaultAsync(c => c.Id == compositionId, cancellationToken);
 
-        if (atom == null)
+        if (composition == null)
             return;
 
         chain.Nodes.Add(new ChainNode
         {
-            AtomId = atomId,
+            NodeId = compositionId,
             Depth = depth,
-            AtomType = atom.AtomType,
-            IsConstant = atom.IsConstant
+            TypeId = composition.TypeId,
+            IsConstant = false
         });
 
-        if (atom.Refs != null)
+        // Get child relations
+        var relations = await _context.Relations
+            .Where(r => r.CompositionId == compositionId)
+            .OrderBy(r => r.Position)
+            .ToListAsync(cancellationToken);
+
+        foreach (var relation in relations)
         {
-            foreach (var refId in atom.Refs)
+            if (relation.ChildConstantId.HasValue)
             {
                 chain.Edges.Add(new ChainEdge
                 {
-                    FromAtomId = atomId,
-                    ToAtomId = refId,
-                    Depth = depth
+                    FromNodeId = compositionId,
+                    ToNodeId = relation.ChildConstantId.Value,
+                    Depth = depth,
+                    IsToConstant = true
+                });
+                // Constants are leaf nodes, no further traversal
+            }
+            else if (relation.ChildCompositionId.HasValue)
+            {
+                chain.Edges.Add(new ChainEdge
+                {
+                    FromNodeId = compositionId,
+                    ToNodeId = relation.ChildCompositionId.Value,
+                    Depth = depth,
+                    IsToConstant = false
                 });
 
-                await TraverseChainAsync(refId, depth + 1, maxDepth, visited, chain, cancellationToken);
+                await TraverseChainAsync(relation.ChildCompositionId.Value, depth + 1, maxDepth, visited, chain, cancellationToken);
             }
         }
-    }
-
-    private static string DetermineRelationType(Atom source, Atom target)
-    {
-        if (source.IsConstant && target.IsConstant)
-            return "semantic_neighbor";
-        if (!source.IsConstant && target.IsConstant)
-            return "composition_to_constant";
-        if (source.IsConstant && !target.IsConstant)
-            return "constant_to_composition";
-        return "composition_similarity";
     }
 
     #endregion
@@ -378,128 +419,213 @@ public class AIQueryService
     #region Transformation Queries - Map between representations
 
     /// <summary>
-    /// Transform content from one representation to another.
-    /// E.g., text → embedding trajectory, or embedding → nearest text
+    /// Transform constant content to another representation.
+    /// E.g., constant → embedding, or constant → text character
     /// </summary>
-    public async Task<TransformationResult> TransformAsync(
-        long sourceAtomId,
+    public async Task<TransformationResult> TransformConstantAsync(
+        long constantId,
         string targetRepresentation,
         CancellationToken cancellationToken = default)
     {
-        var source = await _context.Atoms
+        var constant = await _context.Constants
             .AsNoTracking()
-            .FirstOrDefaultAsync(a => a.Id == sourceAtomId, cancellationToken);
+            .FirstOrDefaultAsync(c => c.Id == constantId, cancellationToken);
 
-        if (source == null)
-            throw new InvalidOperationException($"Source atom {sourceAtomId} not found");
+        if (constant == null)
+            throw new InvalidOperationException($"Constant {constantId} not found");
 
-        _logger?.LogDebug("Transforming atom {AtomId} to {Target}", sourceAtomId, targetRepresentation);
+        _logger?.LogDebug("Transforming constant {ConstantId} to {Target}", constantId, targetRepresentation);
 
         return targetRepresentation.ToLowerInvariant() switch
         {
-            "embedding" => await TransformToEmbeddingAsync(source, cancellationToken),
-            "text" => await TransformToTextAsync(source, cancellationToken),
-            "hilbert" => TransformToHilbert(source),
-            "coordinates" => TransformToCoordinates(source),
+            "embedding" => TransformConstantToEmbedding(constant),
+            "text" => TransformConstantToText(constant),
+            "hilbert" => TransformConstantToHilbert(constant),
+            "coordinates" => TransformConstantToCoordinates(constant),
             _ => throw new ArgumentException($"Unknown target representation: {targetRepresentation}")
         };
     }
 
-    private async Task<TransformationResult> TransformToEmbeddingAsync(Atom source, CancellationToken cancellationToken)
+    /// <summary>
+    /// Transform composition content to another representation.
+    /// E.g., composition → embedding trajectory, or composition → reconstructed text
+    /// </summary>
+    public async Task<TransformationResult> TransformCompositionAsync(
+        long compositionId,
+        string targetRepresentation,
+        CancellationToken cancellationToken = default)
     {
-        // If composition, get all child coordinates as embedding dimensions
-        if (!source.IsConstant && source.Refs != null)
+        var composition = await _context.Compositions
+            .AsNoTracking()
+            .FirstOrDefaultAsync(c => c.Id == compositionId, cancellationToken);
+
+        if (composition == null)
+            throw new InvalidOperationException($"Composition {compositionId} not found");
+
+        _logger?.LogDebug("Transforming composition {CompositionId} to {Target}", compositionId, targetRepresentation);
+
+        return targetRepresentation.ToLowerInvariant() switch
         {
-            var children = await _context.Atoms
-                .AsNoTracking()
-                .Where(a => source.Refs.Contains(a.Id))
-                .ToListAsync(cancellationToken);
+            "embedding" => await TransformCompositionToEmbeddingAsync(composition, cancellationToken),
+            "text" => await TransformCompositionToTextAsync(composition, cancellationToken),
+            "hilbert" => TransformCompositionToHilbert(composition),
+            "coordinates" => TransformCompositionToCoordinates(composition),
+            _ => throw new ArgumentException($"Unknown target representation: {targetRepresentation}")
+        };
+    }
 
-            var embedding = children.Select(c => (float)c.Geom.Coordinate.X).ToArray();
-            return new TransformationResult
-            {
-                SourceAtomId = source.Id,
-                TargetRepresentation = "embedding",
-                Data = embedding,
-                Dimensions = embedding.Length
-            };
-        }
-
-        // Single atom → 4D vector
-        var coord = source.Geom.Coordinate;
+    private static TransformationResult TransformConstantToEmbedding(Constant constant)
+    {
+        var coord = constant.Geom!.Coordinate;
         return new TransformationResult
         {
-            SourceAtomId = source.Id,
+            SourceNodeId = constant.Id,
             TargetRepresentation = "embedding",
             Data = new float[] { (float)coord.X, (float)coord.Y, (float)coord.Z, (float)coord.M },
             Dimensions = 4
         };
     }
 
-    private async Task<TransformationResult> TransformToTextAsync(Atom source, CancellationToken cancellationToken)
+    private static TransformationResult TransformConstantToText(Constant constant)
     {
-        if (source.IsConstant && source.SeedType == 0 && source.SeedValue.HasValue)
+        // Unicode constant (SeedType == 1) → character
+        if (constant.SeedType == 1)
         {
-            // Unicode constant → character
-            var text = char.ConvertFromUtf32((int)source.SeedValue.Value);
+            var text = char.ConvertFromUtf32((int)constant.SeedValue);
             return new TransformationResult
             {
-                SourceAtomId = source.Id,
+                SourceNodeId = constant.Id,
                 TargetRepresentation = "text",
                 Data = text,
                 Dimensions = text.Length
             };
         }
-
-        if (!source.IsConstant && source.Refs != null)
-        {
-            // Composition → reconstruct text
-            var children = await _context.Atoms
-                .AsNoTracking()
-                .Where(a => source.Refs.Contains(a.Id) && a.IsConstant && a.SeedType == 0)
-                .ToDictionaryAsync(a => a.Id, cancellationToken);
-
-            var text = new System.Text.StringBuilder();
-            for (int i = 0; i < source.Refs.Length; i++)
-            {
-                if (children.TryGetValue(source.Refs[i], out var child) && child.SeedValue.HasValue)
-                {
-                    var ch = char.ConvertFromUtf32((int)child.SeedValue.Value);
-                    var mult = source.Multiplicities?[i] ?? 1;
-                    for (int m = 0; m < mult; m++)
-                        text.Append(ch);
-                }
-            }
-
-            return new TransformationResult
-            {
-                SourceAtomId = source.Id,
-                TargetRepresentation = "text",
-                Data = text.ToString(),
-                Dimensions = text.Length
-            };
-        }
-
-        throw new InvalidOperationException("Cannot transform to text: source is not a text composition");
+        throw new InvalidOperationException("Constant is not a text (Unicode) constant");
     }
 
-    private static TransformationResult TransformToHilbert(Atom source)
+    private static TransformationResult TransformConstantToHilbert(Constant constant)
     {
         return new TransformationResult
         {
-            SourceAtomId = source.Id,
+            SourceNodeId = constant.Id,
             TargetRepresentation = "hilbert",
-            Data = new { high = source.HilbertHigh, low = source.HilbertLow },
+            Data = new { high = constant.HilbertHigh, low = constant.HilbertLow },
             Dimensions = 2
         };
     }
 
-    private static TransformationResult TransformToCoordinates(Atom source)
+    private static TransformationResult TransformConstantToCoordinates(Constant constant)
     {
-        var coord = source.Geom.Coordinate;
+        var coord = constant.Geom!.Coordinate;
         return new TransformationResult
         {
-            SourceAtomId = source.Id,
+            SourceNodeId = constant.Id,
+            TargetRepresentation = "coordinates",
+            Data = new { x = coord.X, y = coord.Y, z = coord.Z, m = coord.M },
+            Dimensions = 4
+        };
+    }
+
+    private async Task<TransformationResult> TransformCompositionToEmbeddingAsync(Composition composition, CancellationToken cancellationToken)
+    {
+        // Get all child constant coordinates as embedding dimensions
+        var relations = await _context.Relations
+            .Where(r => r.CompositionId == composition.Id && r.ChildConstantId.HasValue)
+            .OrderBy(r => r.Position)
+            .ToListAsync(cancellationToken);
+
+        if (relations.Count > 0)
+        {
+            var childIds = relations.Select(r => r.ChildConstantId!.Value).ToList();
+            var children = await _context.Constants
+                .AsNoTracking()
+                .Where(c => childIds.Contains(c.Id))
+                .ToListAsync(cancellationToken);
+
+            var embedding = children.Select(c => (float)c.Geom!.Coordinate.X).ToArray();
+            return new TransformationResult
+            {
+                SourceNodeId = composition.Id,
+                TargetRepresentation = "embedding",
+                Data = embedding,
+                Dimensions = embedding.Length
+            };
+        }
+
+        // Composition with no constant children → 4D vector from centroid
+        var coord = composition.Geom!.Coordinate;
+        return new TransformationResult
+        {
+            SourceNodeId = composition.Id,
+            TargetRepresentation = "embedding",
+            Data = new float[] { (float)coord.X, (float)coord.Y, (float)coord.Z, (float)coord.M },
+            Dimensions = 4
+        };
+    }
+
+    private async Task<TransformationResult> TransformCompositionToTextAsync(Composition composition, CancellationToken cancellationToken)
+    {
+        // Get relations ordered by position
+        var relations = await _context.Relations
+            .Where(r => r.CompositionId == composition.Id)
+            .OrderBy(r => r.Position)
+            .ToListAsync(cancellationToken);
+
+        if (relations.Count == 0)
+            throw new InvalidOperationException("Cannot transform to text: composition has no children");
+
+        // Get all child constants that are Unicode (SeedType == 1)
+        var constantIds = relations
+            .Where(r => r.ChildConstantId.HasValue)
+            .Select(r => r.ChildConstantId!.Value)
+            .Distinct()
+            .ToList();
+
+        var children = await _context.Constants
+            .AsNoTracking()
+            .Where(c => constantIds.Contains(c.Id) && c.SeedType == 1)
+            .ToDictionaryAsync(c => c.Id, cancellationToken);
+
+        var text = new System.Text.StringBuilder();
+        foreach (var relation in relations)
+        {
+            if (relation.ChildConstantId.HasValue && children.TryGetValue(relation.ChildConstantId.Value, out var child))
+            {
+                var ch = char.ConvertFromUtf32((int)child.SeedValue);
+                for (int m = 0; m < relation.Multiplicity; m++)
+                    text.Append(ch);
+            }
+        }
+
+        if (text.Length == 0)
+            throw new InvalidOperationException("Cannot transform to text: no Unicode constants found");
+
+        return new TransformationResult
+        {
+            SourceNodeId = composition.Id,
+            TargetRepresentation = "text",
+            Data = text.ToString(),
+            Dimensions = text.Length
+        };
+    }
+
+    private static TransformationResult TransformCompositionToHilbert(Composition composition)
+    {
+        return new TransformationResult
+        {
+            SourceNodeId = composition.Id,
+            TargetRepresentation = "hilbert",
+            Data = new { high = composition.HilbertHigh, low = composition.HilbertLow },
+            Dimensions = 2
+        };
+    }
+
+    private static TransformationResult TransformCompositionToCoordinates(Composition composition)
+    {
+        var coord = composition.Geom!.Coordinate;
+        return new TransformationResult
+        {
+            SourceNodeId = composition.Id,
             TargetRepresentation = "coordinates",
             Data = new { x = coord.X, y = coord.Y, z = coord.Z, m = coord.M },
             Dimensions = 4
@@ -507,22 +633,22 @@ public class AIQueryService
     }
 
     /// <summary>
-    /// Transform trajectory: apply function to all points on a trajectory
+    /// Transform trajectory: apply function to all points on a trajectory composition
     /// </summary>
     public async Task<long> TransformTrajectoryAsync(
-        long trajectoryAtomId,
+        long trajectoryCompositionId,
         Func<Coordinate, Coordinate> transform,
-        string newAtomType,
+        long? newTypeId,
         CancellationToken cancellationToken = default)
     {
-        var trajectory = await _context.Atoms
-            .FirstOrDefaultAsync(a => a.Id == trajectoryAtomId && !a.IsConstant, cancellationToken);
+        var trajectory = await _context.Compositions
+            .FirstOrDefaultAsync(c => c.Id == trajectoryCompositionId, cancellationToken);
 
         if (trajectory == null)
-            throw new InvalidOperationException($"Trajectory {trajectoryAtomId} not found");
+            throw new InvalidOperationException($"Trajectory composition {trajectoryCompositionId} not found");
 
         // Get all points on trajectory
-        var coords = trajectory.Geom.Coordinates;
+        var coords = trajectory.Geom!.Coordinates;
         var transformedCoords = coords.Select(c =>
         {
             var t = transform(c);
@@ -546,22 +672,30 @@ public class AIQueryService
 
         // For transformed trajectories, we create a new composition
         // referencing the original with a transformation marker
-        var transformedAtom = new Atom
+        var transformedComposition = new Composition
         {
-            HilbertHigh = hilbert.High,
-            HilbertLow = hilbert.Low,
+            HilbertHigh = (ulong)hilbert.High,
+            HilbertLow = (ulong)hilbert.Low,
             Geom = newGeom,
-            IsConstant = false,
-            Refs = new[] { trajectoryAtomId },
-            Multiplicities = new[] { 1 },
-            ContentHash = NativeLibrary.ComputeCompositionHash(new[] { trajectoryAtomId }, new[] { 1 }),
-            AtomType = newAtomType
+            ContentHash = NativeLibrary.ComputeCompositionHash(new[] { trajectoryCompositionId }, new[] { 1 }),
+            TypeId = newTypeId
         };
 
-        _context.Atoms.Add(transformedAtom);
+        _context.Compositions.Add(transformedComposition);
         await _context.SaveChangesAsync(cancellationToken);
 
-        return transformedAtom.Id;
+        // Create Relation for the reference to original trajectory
+        var relation = new Relation
+        {
+            CompositionId = transformedComposition.Id,
+            ChildCompositionId = trajectoryCompositionId,
+            Position = 0,
+            Multiplicity = 1
+        };
+        _context.Relations.Add(relation);
+        await _context.SaveChangesAsync(cancellationToken);
+
+        return transformedComposition.Id;
     }
 
     #endregion
@@ -569,27 +703,27 @@ public class AIQueryService
     #region Generation Queries - Create new content from patterns
 
     /// <summary>
-    /// Generate next likely atoms based on spatial context.
+    /// Generate next likely constants based on spatial context.
     /// "Given this trajectory, what comes next?"
     /// </summary>
-    public async Task<List<GenerationCandidate>> GenerateNextAsync(
-        long[] contextAtomIds,
+    public async Task<List<GenerationCandidate>> GenerateNextConstantAsync(
+        long[] contextConstantIds,
         int numCandidates = 5,
         CancellationToken cancellationToken = default)
     {
-        if (contextAtomIds.Length == 0)
-            throw new ArgumentException("Context cannot be empty", nameof(contextAtomIds));
+        if (contextConstantIds.Length == 0)
+            throw new ArgumentException("Context cannot be empty", nameof(contextConstantIds));
 
-        var contextAtoms = await _context.Atoms
+        var contextConstants = await _context.Constants
             .AsNoTracking()
-            .Where(a => contextAtomIds.Contains(a.Id))
+            .Where(c => contextConstantIds.Contains(c.Id))
             .ToListAsync(cancellationToken);
 
-        if (contextAtoms.Count == 0)
-            throw new InvalidOperationException("No context atoms found");
+        if (contextConstants.Count == 0)
+            throw new InvalidOperationException("No context constants found");
 
         // Compute trajectory vector from context
-        var contextCoords = contextAtoms.Select(a => a.Geom.Coordinate).ToList();
+        var contextCoords = contextConstants.Select(c => c.Geom!.Coordinate).ToList();
         var centroid = ComputeCentroid(contextCoords);
 
         // If we have a sequence, compute momentum (direction of travel)
@@ -609,45 +743,45 @@ public class AIQueryService
 
         var predictedGeom = _geometryFactory.CreatePoint(predicted);
 
-        // Find atoms near predicted position
-        var candidates = await _context.Atoms
+        // Find constants near predicted position
+        var candidates = await _context.Constants
             .AsNoTracking()
-            .Where(a => !contextAtomIds.Contains(a.Id))
-            .OrderBy(a => a.Geom.Distance(predictedGeom))
+            .Where(c => !contextConstantIds.Contains(c.Id))
+            .OrderBy(c => c.Geom!.Distance(predictedGeom))
             .Take(numCandidates * 2) // Get more to filter
             .ToListAsync(cancellationToken);
 
         return candidates.Take(numCandidates).Select((c, i) => new GenerationCandidate
         {
-            AtomId = c.Id,
-            Probability = 1.0 / (1.0 + c.Geom.Distance(predictedGeom)),
+            NodeId = c.Id,
+            Probability = 1.0 / (1.0 + c.Geom!.Distance(predictedGeom)),
             Rank = i + 1,
-            AtomType = c.AtomType,
-            Distance = c.Geom.Distance(predictedGeom)
+            IsConstant = true,
+            Distance = c.Geom!.Distance(predictedGeom)
         }).ToList();
     }
 
     /// <summary>
-    /// Generate by analogy: "A is to B as C is to ?"
+    /// Generate by analogy using constants: "A is to B as C is to ?"
     /// </summary>
     public async Task<List<GenerationCandidate>> GenerateByAnalogyAsync(
-        long atomA,
-        long atomB,
-        long atomC,
+        long constantA,
+        long constantB,
+        long constantC,
         int numCandidates = 5,
         CancellationToken cancellationToken = default)
     {
-        var atoms = await _context.Atoms
+        var constants = await _context.Constants
             .AsNoTracking()
-            .Where(a => a.Id == atomA || a.Id == atomB || a.Id == atomC)
-            .ToDictionaryAsync(a => a.Id, cancellationToken);
+            .Where(c => c.Id == constantA || c.Id == constantB || c.Id == constantC)
+            .ToDictionaryAsync(c => c.Id, cancellationToken);
 
-        if (!atoms.ContainsKey(atomA) || !atoms.ContainsKey(atomB) || !atoms.ContainsKey(atomC))
-            throw new InvalidOperationException("One or more analogy atoms not found");
+        if (!constants.ContainsKey(constantA) || !constants.ContainsKey(constantB) || !constants.ContainsKey(constantC))
+            throw new InvalidOperationException("One or more analogy constants not found");
 
-        var coordA = atoms[atomA].Geom.Coordinate;
-        var coordB = atoms[atomB].Geom.Coordinate;
-        var coordC = atoms[atomC].Geom.Coordinate;
+        var coordA = constants[constantA].Geom!.Coordinate;
+        var coordB = constants[constantB].Geom!.Coordinate;
+        var coordC = constants[constantC].Geom!.Coordinate;
 
         // Compute A→B vector and apply to C
         var vectorAB = new CoordinateZM(
@@ -666,46 +800,46 @@ public class AIQueryService
 
         var predictedGeom = _geometryFactory.CreatePoint(predictedD);
 
-        // Find atoms near predicted D position
-        var candidates = await _context.Atoms
+        // Find constants near predicted D position
+        var candidates = await _context.Constants
             .AsNoTracking()
-            .Where(a => a.Id != atomA && a.Id != atomB && a.Id != atomC)
-            .OrderBy(a => a.Geom.Distance(predictedGeom))
+            .Where(c => c.Id != constantA && c.Id != constantB && c.Id != constantC)
+            .OrderBy(c => c.Geom!.Distance(predictedGeom))
             .Take(numCandidates)
             .ToListAsync(cancellationToken);
 
         return candidates.Select((c, i) => new GenerationCandidate
         {
-            AtomId = c.Id,
-            Probability = 1.0 / (1.0 + c.Geom.Distance(predictedGeom)),
+            NodeId = c.Id,
+            Probability = 1.0 / (1.0 + c.Geom!.Distance(predictedGeom)),
             Rank = i + 1,
-            AtomType = c.AtomType,
-            Distance = c.Geom.Distance(predictedGeom)
+            IsConstant = true,
+            Distance = c.Geom!.Distance(predictedGeom)
         }).ToList();
     }
 
     /// <summary>
-    /// Generate composition: combine multiple atoms into new structure
+    /// Generate composition: combine multiple constants into new structure
     /// </summary>
     public async Task<long> GenerateCompositionAsync(
-        long[] componentAtomIds,
-        string compositionType,
+        long[] componentConstantIds,
+        long? compositionTypeId,
         CancellationToken cancellationToken = default)
     {
-        if (componentAtomIds.Length == 0)
-            throw new ArgumentException("Components cannot be empty", nameof(componentAtomIds));
+        if (componentConstantIds.Length == 0)
+            throw new ArgumentException("Components cannot be empty", nameof(componentConstantIds));
 
-        var components = await _context.Atoms
+        var components = await _context.Constants
             .AsNoTracking()
-            .Where(a => componentAtomIds.Contains(a.Id))
-            .ToDictionaryAsync(a => a.Id, cancellationToken);
+            .Where(c => componentConstantIds.Contains(c.Id))
+            .ToDictionaryAsync(c => c.Id, cancellationToken);
 
-        if (components.Count != componentAtomIds.Length)
-            throw new InvalidOperationException("Some component atoms not found");
+        if (components.Count != componentConstantIds.Length)
+            throw new InvalidOperationException("Some component constants not found");
 
         // Build geometry from component points
-        var coords = componentAtomIds
-            .Select(id => components[id].Geom.Coordinate)
+        var coords = componentConstantIds
+            .Select(id => components[id].Geom!.Coordinate)
             .Select(c => new CoordinateZM(c.X, c.Y, c.Z, c.M))
             .ToArray();
 
@@ -714,13 +848,13 @@ public class AIQueryService
             : _geometryFactory.CreateLineString(coords);
 
         // Compute hash and Hilbert
-        var multiplicities = Enumerable.Repeat(1, componentAtomIds.Length).ToArray();
-        var contentHash = NativeLibrary.ComputeCompositionHash(componentAtomIds, multiplicities);
+        var multiplicities = Enumerable.Repeat(1, componentConstantIds.Length).ToArray();
+        var contentHash = NativeLibrary.ComputeCompositionHash(componentConstantIds, multiplicities);
 
         // Check if already exists
-        var existing = await _context.Atoms
-            .Where(a => a.ContentHash == contentHash)
-            .Select(a => a.Id)
+        var existing = await _context.Compositions
+            .Where(c => c.ContentHash == contentHash)
+            .Select(c => c.Id)
             .FirstOrDefaultAsync(cancellationToken);
 
         if (existing != 0)
@@ -735,19 +869,30 @@ public class AIQueryService
             M = centroid.M
         });
 
-        var composition = new Atom
+        var composition = new Composition
         {
-            HilbertHigh = hilbert.High,
-            HilbertLow = hilbert.Low,
+            HilbertHigh = (ulong)hilbert.High,
+            HilbertLow = (ulong)hilbert.Low,
             Geom = geom,
-            IsConstant = false,
-            Refs = componentAtomIds,
-            Multiplicities = multiplicities,
             ContentHash = contentHash,
-            AtomType = compositionType
+            TypeId = compositionTypeId
         };
 
-        _context.Atoms.Add(composition);
+        _context.Compositions.Add(composition);
+        await _context.SaveChangesAsync(cancellationToken);
+
+        // Create Relation edges for the composition
+        for (int i = 0; i < componentConstantIds.Length; i++)
+        {
+            var relation = new Relation
+            {
+                CompositionId = composition.Id,
+                ChildConstantId = componentConstantIds[i],
+                Position = i,
+                Multiplicity = 1
+            };
+            _context.Relations.Add(relation);
+        }
         await _context.SaveChangesAsync(cancellationToken);
 
         return composition.Id;
@@ -773,7 +918,7 @@ public class AIQueryService
 
 public class AttentionResult
 {
-    public long KeyAtomId { get; set; }
+    public long KeyNodeId { get; set; }
     public double RawWeight { get; set; }
     public double NormalizedWeight { get; set; }
     public double Distance { get; set; }
@@ -788,18 +933,18 @@ public class MultiHeadAttentionResult
 
 public class InferenceResult
 {
-    public long AtomId { get; set; }
+    public long NodeId { get; set; }
     public double Confidence { get; set; }
     public string RelationType { get; set; } = "";
-    public string AtomType { get; set; } = "";
+    public long? TypeId { get; set; }
     public bool IsConstant { get; set; }
 }
 
 public class GapInferenceResult
 {
-    public long GapStartAtomId { get; set; }
-    public long GapEndAtomId { get; set; }
-    public long GapSize { get; set; }
+    public long GapStartNodeId { get; set; }
+    public long GapEndNodeId { get; set; }
+    public ulong GapSize { get; set; }
     public double PredictedX { get; set; }
     public double PredictedY { get; set; }
     public double PredictedZ { get; set; }
@@ -809,29 +954,30 @@ public class GapInferenceResult
 
 public class InferenceChain
 {
-    public long RootAtomId { get; set; }
+    public long RootNodeId { get; set; }
     public List<ChainNode> Nodes { get; set; } = new();
     public List<ChainEdge> Edges { get; set; } = new();
 }
 
 public class ChainNode
 {
-    public long AtomId { get; set; }
+    public long NodeId { get; set; }
     public int Depth { get; set; }
-    public string AtomType { get; set; } = "";
+    public long? TypeId { get; set; }
     public bool IsConstant { get; set; }
 }
 
 public class ChainEdge
 {
-    public long FromAtomId { get; set; }
-    public long ToAtomId { get; set; }
+    public long FromNodeId { get; set; }
+    public long ToNodeId { get; set; }
     public int Depth { get; set; }
+    public bool IsToConstant { get; set; }
 }
 
 public class TransformationResult
 {
-    public long SourceAtomId { get; set; }
+    public long SourceNodeId { get; set; }
     public string TargetRepresentation { get; set; } = "";
     public object? Data { get; set; }
     public int Dimensions { get; set; }
@@ -839,10 +985,11 @@ public class TransformationResult
 
 public class GenerationCandidate
 {
-    public long AtomId { get; set; }
+    public long NodeId { get; set; }
     public double Probability { get; set; }
     public int Rank { get; set; }
-    public string AtomType { get; set; } = "";
+    public long? TypeId { get; set; }
+    public bool IsConstant { get; set; }
     public double Distance { get; set; }
 }
 

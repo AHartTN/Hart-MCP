@@ -1,5 +1,6 @@
 using FluentAssertions;
 using Hart.MCP.Core.Data;
+using Hart.MCP.Core.Entities;
 using Hart.MCP.Core.Services;
 using Hart.MCP.Core.Services.Ingestion;
 using Microsoft.EntityFrameworkCore;
@@ -50,8 +51,10 @@ public class RealModelIngestionTests : IDisposable
 
     public void Dispose()
     {
-        // Clean up test data
-        _context.Atoms.RemoveRange(_context.Atoms);
+        // Clean up test data - delete Relations first due to FK constraints
+        _context.Relations.RemoveRange(_context.Relations);
+        _context.Compositions.RemoveRange(_context.Compositions);
+        _context.Constants.RemoveRange(_context.Constants);
         _context.SaveChanges();
         _context.Dispose();
     }
@@ -66,8 +69,10 @@ public class RealModelIngestionTests : IDisposable
             .Options;
         var context = new HartDbContext(options);
         context.Database.EnsureCreated();
-        // Clear any existing test data
-        context.Atoms.RemoveRange(context.Atoms);
+        // Clear any existing test data - delete Relations first due to FK constraints
+        context.Relations.RemoveRange(context.Relations);
+        context.Compositions.RemoveRange(context.Compositions);
+        context.Constants.RemoveRange(context.Constants);
         context.SaveChanges();
         return context;
     }
@@ -186,9 +191,9 @@ public class RealModelIngestionTests : IDisposable
         // SUMMARY
         // ════════════════════════════════════════════════════════════
         totalSw.Stop();
-        var totalAtoms = await _context.Atoms.CountAsync();
-        var constants = await _context.Atoms.CountAsync(a => a.IsConstant);
-        var compositions = await _context.Atoms.CountAsync(a => !a.IsConstant);
+        var constants = await _context.Constants.CountAsync();
+        var compositions = await _context.Compositions.CountAsync();
+        var totalAtoms = constants + compositions;
 
         Console.WriteLine("╔══════════════════════════════════════════════════════════════╗");
         Console.WriteLine("║                         SUMMARY                               ║");
@@ -202,7 +207,7 @@ public class RealModelIngestionTests : IDisposable
         // Assertions
         result.TensorCount.Should().BeGreaterThan(0);
         result.TotalParameters.Should().BeGreaterThan(0);
-        result.RootAtomId.Should().BeGreaterThan(0);
+        result.RootCompositionId.Should().BeGreaterThan(0);
         
         // Performance assertion: 80MB model should complete in < 60 seconds (generous for CI)
         modelSw.ElapsedMilliseconds.Should().BeLessThan(60000, "model ingestion should complete in < 60s");
@@ -234,8 +239,10 @@ public class RealModelIngestionTests : IDisposable
         // Test with default threshold (conservative, ~20-40% sparse typically)
         await TestSparseIngestion(safeTensorPath, StreamingModelIngestionService.DEFAULT_SPARSITY_THRESHOLD, "Conservative");
         
-        // Reset DB for second test
-        _context.Atoms.RemoveRange(_context.Atoms);
+        // Reset DB for second test - delete Relations first due to FK constraints
+        _context.Relations.RemoveRange(_context.Relations);
+        _context.Compositions.RemoveRange(_context.Compositions);
+        _context.Constants.RemoveRange(_context.Constants);
         await _context.SaveChangesAsync();
         
         // Test with aggressive threshold (60%+ sparse)
@@ -274,7 +281,7 @@ public class RealModelIngestionTests : IDisposable
 
         Console.WriteLine("");
         Console.WriteLine("=== RESULTS ===");
-        Console.WriteLine($"Root Atom ID:      {result.RootAtomId}");
+        Console.WriteLine($"Root Composition ID: {result.RootCompositionId}");
         Console.WriteLine($"Tensor Count:      {result.TensorCount}");
         Console.WriteLine($"Total Parameters:  {result.TotalParameters:N0}");
         Console.WriteLine("");
@@ -292,13 +299,13 @@ public class RealModelIngestionTests : IDisposable
         _output.WriteLine($"Total: {result.TotalParameters:N0} params, {result.SparsityPercent:F1}% sparse, {sw.ElapsedMilliseconds}ms");
 
         // Verify DB state
-        var totalAtoms = await _context.Atoms.CountAsync();
+        var totalAtoms = await _context.Constants.CountAsync() + await _context.Compositions.CountAsync();
         Console.WriteLine($"Total Atoms in DB: {totalAtoms:N0}");
         Console.WriteLine("");
 
         result.TensorCount.Should().BeGreaterThan(0);
         result.TotalParameters.Should().BeGreaterThan(0);
-        result.RootAtomId.Should().BeGreaterThan(0);
+        result.RootCompositionId.Should().BeGreaterThan(0);
     }
 
     [Fact]
@@ -334,15 +341,17 @@ public class RealModelIngestionTests : IDisposable
         {
             if (tokenAtomIds.TryGetValue(tokenId, out var atomId))
             {
-                var atom = await _context.Atoms.FindAsync(atomId);
-                _output.WriteLine($"  Token {tokenId}: atom {atomId}, type={atom?.AtomType}, constant={atom?.IsConstant}");
+                // Check if it's a composition (tokens are typically compositions of codepoints)
+                var composition = await _context.Compositions.FindAsync(atomId);
+                var isComposition = composition != null;
+                _output.WriteLine($"  Token {tokenId}: atom {atomId}, composition={isComposition}");
             }
         }
 
         // Database stats
-        var totalAtoms = await _context.Atoms.CountAsync();
-        var constantAtoms = await _context.Atoms.CountAsync(a => a.IsConstant);
-        var compositionAtoms = await _context.Atoms.CountAsync(a => !a.IsConstant);
+        var constantAtoms = await _context.Constants.CountAsync();
+        var compositionAtoms = await _context.Compositions.CountAsync();
+        var totalAtoms = constantAtoms + compositionAtoms;
 
         _output.WriteLine("");
         _output.WriteLine("=== DATABASE STATE ===");
@@ -371,13 +380,13 @@ public class RealModelIngestionTests : IDisposable
 
         // First ingestion
         var result1 = await _modelService.IngestVocabularyAsync(tokenizerPath, "model-1");
-        var atomsAfterFirst = await _context.Atoms.CountAsync();
+        var atomsAfterFirst = await _context.Constants.CountAsync() + await _context.Compositions.CountAsync();
 
         _output.WriteLine($"After 1st ingestion: {result1.Count:N0} tokens → {atomsAfterFirst:N0} atoms");
 
         // Second ingestion - should reuse all atoms
         var result2 = await _modelService.IngestVocabularyAsync(tokenizerPath, "model-2");
-        var atomsAfterSecond = await _context.Atoms.CountAsync();
+        var atomsAfterSecond = await _context.Constants.CountAsync() + await _context.Compositions.CountAsync();
 
         _output.WriteLine($"After 2nd ingestion: {result2.Count:N0} tokens → {atomsAfterSecond:N0} atoms");
         _output.WriteLine("");
@@ -445,25 +454,31 @@ public class RealModelIngestionTests : IDisposable
 
         _output.WriteLine($"Verifying tensor: {tensorName}");
 
-        // Get the atom
-        var atom = await _context.Atoms.FindAsync(tensorAtomId);
-        atom.Should().NotBeNull();
-        atom!.Refs.Should().NotBeNull();
+        // Get the composition (tensor is a composition of float constants)
+        var composition = await _context.Compositions.FindAsync(tensorAtomId);
+        composition.Should().NotBeNull();
+        
+        // Get references via Relations table
+        var relations = await _context.Relations
+            .Where(r => r.CompositionId == tensorAtomId)
+            .OrderBy(r => r.Position)
+            .ToListAsync();
+        relations.Should().NotBeEmpty();
 
-        var numElements = atom.Refs!.Length;
+        var numElements = relations.Count;
         _output.WriteLine($"Elements: {numElements:N0}");
 
-        // Reconstruct the tensor
-        var componentIds = atom.Refs;
-        var components = await _context.Atoms
-            .Where(a => componentIds.Contains(a.Id) && a.IsConstant)
-            .ToDictionaryAsync(a => a.Id);
+        // Reconstruct the tensor via Relations
+        var componentIds = relations.Where(r => r.ChildConstantId.HasValue).Select(r => r.ChildConstantId!.Value).ToArray();
+        var components = await _context.Constants
+            .Where(c => componentIds.Contains(c.Id))
+            .ToDictionaryAsync(c => c.Id);
 
         var reconstructed = new float[numElements];
         for (int i = 0; i < numElements; i++)
         {
-            var component = components[componentIds[i]];
-            uint bits = (uint)(component.SeedValue ?? 0);
+            var component = components[relations[i].ChildConstantId!.Value];
+            uint bits = (uint)component.SeedValue;
             reconstructed[i] = BitConverter.UInt32BitsToSingle(bits);
         }
 

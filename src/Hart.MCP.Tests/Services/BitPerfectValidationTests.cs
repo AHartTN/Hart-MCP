@@ -83,7 +83,7 @@ public class BitPerfectValidationTests : IDisposable
         exportStopwatch.Stop();
 
         _output.WriteLine($"Export: {exportStopwatch.ElapsedMilliseconds}ms");
-        _output.WriteLine($"  Atoms traversed: {exportResult.Stats.TotalAtoms}");
+        _output.WriteLine($"  Nodes traversed: {exportResult.Stats.TotalNodes}");
         _output.WriteLine($"  Cache hits: {exportResult.Stats.CacheHits}");
         _output.WriteLine($"  Cache hit rate: {exportResult.Stats.CacheHitRate:P1}");
         _output.WriteLine($"  DB queries: {exportResult.Stats.DbQueries}");
@@ -164,8 +164,8 @@ public class BitPerfectValidationTests : IDisposable
         (await _exportService.ExportTextAsync(result2.RootAtomId)).Text.Should().Be(text2);
         (await _exportService.ExportTextAsync(result3.RootAtomId)).Text.Should().Be(text3);
 
-        // Character constants should be shared
-        var charAtomCount = await _context.Atoms.CountAsync(a => a.IsConstant && a.AtomType == "char");
+        // Character constants should be shared - query Constants with SeedType == 0 (Unicode)
+        var charAtomCount = await _context.Constants.CountAsync(c => c.SeedType == 0);
         var allUniqueChars = (text1 + text2 + text3).Distinct().Count();
         
         charAtomCount.Should().BeLessThanOrEqualTo(allUniqueChars,
@@ -288,7 +288,7 @@ public class BitPerfectValidationTests : IDisposable
         var ingestionResult = await _ingestionService.IngestTextHierarchicallyAsync(original);
         var exportResult = await _exportService.ExportTextAsync(ingestionResult.RootAtomId);
 
-        exportResult.Stats.TotalAtoms.Should().BeGreaterThan(0);
+        exportResult.Stats.TotalNodes.Should().BeGreaterThan(0);
         exportResult.Stats.CacheHits.Should().BeGreaterThanOrEqualTo(0);
         
         _output.WriteLine($"Cache hit rate: {exportResult.Stats.CacheHitRate:P1}");

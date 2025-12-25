@@ -22,7 +22,7 @@ namespace Hart.MCP.Core.Services.Ingestion;
 /// - Process floats in chunks (default 1M floats per chunk)
 /// - SPARSE ENCODING: Skip near-zero weights (configurable threshold)
 /// - Batch DB writes (flush every N unique values)
-/// - LRU cache for float→atomId lookups
+/// - LRU cache for float→constantId lookups
 /// 
 /// SPARSE ENCODING INSIGHT:
 /// Most weights are near-zero (no meaningful relationship).
@@ -46,7 +46,7 @@ public class StreamingModelIngestionService : IngestionServiceBase
     
     // Configuration
     private const int CHUNK_SIZE = 1_000_000;          // Process N floats at a time
-    private const int CACHE_SIZE = 500_000;            // LRU cache size for float→atomId
+    private const int CACHE_SIZE = 500_000;            // LRU cache size for float→constantId
     
     // Sparse encoding defaults
     public const float DEFAULT_SPARSITY_THRESHOLD = 1e-6f;  // |weight| < this = don't store
@@ -191,17 +191,17 @@ public class StreamingModelIngestionService : IngestionServiceBase
         var createSw = System.Diagnostics.Stopwatch.StartNew();
         progress?.Report(new ModelIngestionProgress
         {
-            Phase = "Creating atoms",
+            Phase = "Creating constants",
             TensorsTotal = metadata.Tensors.Count,
             TensorsProcessed = tensorIndex,
             SparsityPercent = _totalValues > 0 ? 100.0 * _skippedValues / _totalValues : 0
         });
 
-        await BulkCreateFloatAtomsAsync(allUniqueBits.ToArray(), ct);
+        await BulkCreateFloatConstantsAsync(allUniqueBits.ToArray(), ct);
         createSw.Stop();
 
         Logger?.LogInformation(
-            "Float atoms created: {Count:N0} atoms in {Time}ms ({Rate:N0}/sec)",
+            "Float constants created: {Count:N0} constants in {Time}ms ({Rate:N0}/sec)",
             allUniqueBits.Count, createSw.ElapsedMilliseconds,
             allUniqueBits.Count * 1000.0 / Math.Max(1, createSw.ElapsedMilliseconds));
 
@@ -209,7 +209,7 @@ public class StreamingModelIngestionService : IngestionServiceBase
         // PHASE 4: COMPOSE - Create tensor compositions (batch)
         // ============================================
         var composeSw = System.Diagnostics.Stopwatch.StartNew();
-        var tensorAtoms = new List<Atom>();
+        var tensorDataList = new List<SparseTensorData>();
 
         foreach (var (tensorName, tensorInfo) in metadata.Tensors)
         {
@@ -218,36 +218,52 @@ public class StreamingModelIngestionService : IngestionServiceBase
 
             ct.ThrowIfCancellationRequested();
 
-            // Resolve bits → atomId from cache (no DB)
+            // Resolve bits → constantId from cache (no DB)
             var refs = significantValues.Select(sv => _floatCache[sv.bits]).ToArray();
             var indices = significantValues.Select(sv => sv.index).ToArray();
 
-            // Create composition atom
-            var tensorAtom = CreateSparseTensorAtom(refs, indices, tensorInfo, modelName);
-            tensorAtoms.Add(tensorAtom);
+            // Create composition (returns SparseTensorData with refs for Relation creation)
+            var sparseData = CreateSparseTensorComposition(refs, indices, tensorInfo, modelName);
+            tensorDataList.Add(sparseData);
 
             if (IsEmbeddingTensor(tensorName))
-                result.EmbeddingAtomIds[tensorName] = 0; // Will update after save
+                result.EmbeddingCompositionIds[tensorName] = 0; // Will update after save
             else
-                result.WeightAtomIds[tensorName] = 0;
+                result.WeightCompositionIds[tensorName] = 0;
         }
 
         // Bulk save all tensor compositions
-        Context.Atoms.AddRange(tensorAtoms);
+        Context.Compositions.AddRange(tensorDataList.Select(td => td.Composition));
+        await Context.SaveChangesAsync(ct);
+
+        // Create Relation entries for each tensor's references (to Constants)
+        foreach (var sparseData in tensorDataList)
+        {
+            for (int i = 0; i < sparseData.Refs.Length; i++)
+            {
+                Context.Relations.Add(new Relation
+                {
+                    CompositionId = sparseData.Composition.Id,
+                    ChildConstantId = sparseData.Refs[i],
+                    Position = sparseData.Indices[i], // Original tensor index for sparse reconstruction
+                    Multiplicity = sparseData.Multiplicities[i]
+                });
+            }
+        }
         await Context.SaveChangesAsync(ct);
 
         // Update result with actual IDs
-        int atomIdx = 0;
+        int compositionIdx = 0;
         foreach (var (tensorName, _) in metadata.Tensors)
         {
             if (!tensorData.ContainsKey(tensorName)) continue;
             
-            var atomId = tensorAtoms[atomIdx].Id;
-            if (result.EmbeddingAtomIds.ContainsKey(tensorName))
-                result.EmbeddingAtomIds[tensorName] = atomId;
-            else if (result.WeightAtomIds.ContainsKey(tensorName))
-                result.WeightAtomIds[tensorName] = atomId;
-            atomIdx++;
+            var compositionId = tensorDataList[compositionIdx].Composition.Id;
+            if (result.EmbeddingCompositionIds.ContainsKey(tensorName))
+                result.EmbeddingCompositionIds[tensorName] = compositionId;
+            else if (result.WeightCompositionIds.ContainsKey(tensorName))
+                result.WeightCompositionIds[tensorName] = compositionId;
+            compositionIdx++;
         }
 
         composeSw.Stop();
@@ -262,14 +278,14 @@ public class StreamingModelIngestionService : IngestionServiceBase
         // ============================================
         // PHASE 5: Create root model composition
         // ============================================
-        var allTensorAtomIds = result.EmbeddingAtomIds.Values
-            .Concat(result.WeightAtomIds.Values)
+        var allTensorCompositionIds = result.EmbeddingCompositionIds.Values
+            .Concat(result.WeightCompositionIds.Values)
             .ToArray();
 
-        if (allTensorAtomIds.Length > 0)
+        if (allTensorCompositionIds.Length > 0)
         {
-            result.RootAtomId = await CreateModelCompositionAsync(
-                allTensorAtomIds, modelName, metadata, ct);
+            result.RootCompositionId = await CreateModelCompositionAsync(
+                allTensorCompositionIds, modelName, metadata, ct);
         }
 
         stopwatch.Stop();
@@ -327,51 +343,49 @@ public class StreamingModelIngestionService : IngestionServiceBase
     }
 
     /// <summary>
-    /// Bulk create all float atoms in ONE database operation.
+    /// Bulk create all float constants in ONE database operation.
     /// </summary>
-    private async Task BulkCreateFloatAtomsAsync(uint[] allBits, CancellationToken ct)
+    private async Task BulkCreateFloatConstantsAsync(uint[] allBits, CancellationToken ct)
     {
         if (allBits.Length == 0) return;
 
-        // Generate all atoms in parallel (CPU-bound)
-        var atoms = new Atom[allBits.Length];
+        // Generate all constants in parallel (CPU-bound)
+        var constants = new Constant[allBits.Length];
         Parallel.For(0, allBits.Length, i =>
         {
             var bits = allBits[i];
             var baseHash = HartNative.ComputeSeedHash(bits);
-            var contentHash = ComputeTypedContentHash(baseHash, "float32");
+            var contentHash = ComputeTypedContentHash(baseHash, SEED_TYPE_FLOAT_BITS);
             var point = HartNative.project_seed_to_hypersphere(bits);
             var hilbert = HartNative.point_to_hilbert(point);
             var geom = GeometryFactory.CreatePoint(new CoordinateZM(point.X, point.Y, point.Z, point.M));
 
-            atoms[i] = new Atom
+            constants[i] = new Constant
             {
-                HilbertHigh = hilbert.High,
-                HilbertLow = hilbert.Low,
+                HilbertHigh = (ulong)hilbert.High,
+                HilbertLow = (ulong)hilbert.Low,
                 Geom = geom,
-                IsConstant = true,
                 SeedValue = bits,
                 SeedType = SEED_TYPE_FLOAT_BITS,
-                ContentHash = contentHash,
-                AtomType = "float32"
+                ContentHash = contentHash
             };
         });
 
         // Bulk insert
-        Context.Atoms.AddRange(atoms);
+        Context.Constants.AddRange(constants);
         await Context.SaveChangesAsync(ct);
 
         // Update cache with IDs
         for (int i = 0; i < allBits.Length; i++)
         {
-            _floatCache[allBits[i]] = atoms[i].Id;
+            _floatCache[allBits[i]] = constants[i].Id;
         }
     }
 
     /// <summary>
-    /// Create a sparse tensor atom (no DB save - caller batches).
+    /// Create a sparse tensor composition (no DB save - caller batches).
     /// </summary>
-    private Atom CreateSparseTensorAtom(
+    private SparseTensorData CreateSparseTensorComposition(
         long[] refs,
         int[] indices,
         TensorInfo tensorInfo,
@@ -404,38 +418,37 @@ public class StreamingModelIngestionService : IngestionServiceBase
         var geom = GeometryFactory.CreatePoint(new CoordinateZM(avgX, avgY, avgZ, avgM));
         var hilbert = HartNative.point_to_hilbert(new HartNative.PointZM { X = avgX, Y = avgY, Z = avgZ, M = avgM });
 
-        var meta = new
+        // Store tensor info as composition references instead of JSONB metadata
+        // The sparse indices are encoded in the position field of Relation entries
+        return new SparseTensorData
         {
-            model = modelName,
-            tensor_name = tensorInfo.Name,
-            dtype = tensorInfo.DType,
-            shape = tensorInfo.Shape,
-            total_elements = tensorInfo.TotalElements,
-            sparse = true,
-            stored_count = refs.Length,
-            sparsity = 100.0 * (tensorInfo.TotalElements - refs.Length) / tensorInfo.TotalElements,
-            indices = indices
-        };
-
-        return new Atom
-        {
-            HilbertHigh = hilbert.High,
-            HilbertLow = hilbert.Low,
-            Geom = geom,
-            IsConstant = false,
+            Composition = new Composition
+            {
+                HilbertHigh = (ulong)hilbert.High,
+                HilbertLow = (ulong)hilbert.Low,
+                Geom = geom,
+                ContentHash = contentHash
+            },
             Refs = refs,
             Multiplicities = multiplicities,
-            ContentHash = contentHash,
-            AtomType = IsEmbeddingTensor(tensorInfo.Name) ? "sparse_embedding" : "sparse_weight",
-            Metadata = System.Text.Json.JsonSerializer.Serialize(meta)
+            Indices = indices
         };
+    }
+
+    // Helper class to carry sparse tensor data until we persist Relations
+    private class SparseTensorData
+    {
+        public Composition Composition { get; set; } = null!;
+        public long[] Refs { get; set; } = Array.Empty<long>();
+        public int[] Multiplicities { get; set; } = Array.Empty<int>();
+        public int[] Indices { get; set; } = Array.Empty<int>();
     }
 
     /// <summary>
     /// Stream a single tensor with sparse encoding using proper batching:
     /// 1. Stream entire tensor, collect significant (index, bits) pairs
     /// 2. Batch lookup/create all unique floats at once
-    /// 3. Resolve bits→atomId in memory
+    /// 3. Resolve bits→constantId in memory
     /// 4. Create composition
     /// </summary>
     private async Task<long> IngestTensorStreamingAsync(
@@ -452,7 +465,7 @@ public class StreamingModelIngestionService : IngestionServiceBase
         var totalElements = tensorInfo.TotalElements;
         
         // PHASE 1: Stream tensor, collect significant (index, bits) pairs
-        // Store bits (not atomIds yet) - resolve in batch later
+        // Store bits (not constantIds yet) - resolve in batch later
         var significantValues = new List<(int index, uint bits)>();
         var uniqueBits = new HashSet<uint>();
         
@@ -486,21 +499,21 @@ public class StreamingModelIngestionService : IngestionServiceBase
             "Tensor {Name}: {Significant:N0} significant values, {Unique:N0} unique floats",
             tensorInfo.Name, significantValues.Count, uniqueBits.Count);
 
-        // PHASE 2: Batch lookup/create all unique floats at once
-        await EnsureFloatAtomsBatchAsync(uniqueBits.ToArray(), ct);
+        // PHASE 2: Batch lookup/create all unique float constants at once
+        await EnsureFloatConstantsBatchAsync(uniqueBits.ToArray(), ct);
 
-        // PHASE 3: Resolve bits→atomId for all refs (from cache, no DB)
-        var sparseRefs = new List<(int index, long atomId)>(significantValues.Count);
+        // PHASE 3: Resolve bits→constantId for all refs (from cache, no DB)
+        var sparseRefs = new List<(int index, long constantId)>(significantValues.Count);
         foreach (var (index, bits) in significantValues)
         {
             sparseRefs.Add((index, _floatCache[bits]));
         }
 
         // PHASE 4: Create SPARSE tensor composition
-        var tensorAtomId = await CreateSparseTensorCompositionAsync(
+        var tensorCompositionId = await CreateSparseTensorCompositionAsync(
             sparseRefs, tensorInfo, modelName, ct);
 
-        return tensorAtomId;
+        return tensorCompositionId;
     }
 
     /// <summary>
@@ -540,7 +553,7 @@ public class StreamingModelIngestionService : IngestionServiceBase
     /// <summary>
     /// Batch lookup/create all unique floats in one efficient operation.
     /// </summary>
-    private async Task EnsureFloatAtomsBatchAsync(uint[] allUniqueBits, CancellationToken ct)
+    private async Task EnsureFloatConstantsBatchAsync(uint[] allUniqueBits, CancellationToken ct)
     {
         if (allUniqueBits.Length == 0) return;
 
@@ -553,61 +566,55 @@ public class StreamingModelIngestionService : IngestionServiceBase
         // BATCH 1: Lookup existing in DB
         var bitsAsLong = uncachedBits.Select(b => (long)b).ToList();
         
-        var existing = await Context.Atoms
-            .Where(a => a.IsConstant && a.AtomType == "float32" && 
-                        a.SeedValue.HasValue && bitsAsLong.Contains(a.SeedValue.Value))
-            .Select(a => new { a.Id, a.SeedValue })
+        var existing = await Context.Constants
+            .Where(c => bitsAsLong.Contains(c.SeedValue) &&
+                        c.SeedType == SEED_TYPE_FLOAT_BITS)
+            .Select(c => new { c.Id, c.SeedValue })
             .ToListAsync(ct);
 
-        foreach (var atom in existing)
+        foreach (var constant in existing)
         {
-            if (atom.SeedValue.HasValue)
-            {
-                var bits = (uint)atom.SeedValue.Value;
-                _floatCache[bits] = atom.Id;
-            }
+            var bits = (uint)constant.SeedValue;
+            _floatCache[bits] = constant.Id;
         }
 
         // Find missing (not in DB)
-        var existingBits = new HashSet<uint>(existing.Where(a => a.SeedValue.HasValue)
-            .Select(a => (uint)a.SeedValue!.Value));
+        var existingBits = new HashSet<uint>(existing.Select(c => (uint)c.SeedValue));
         var missing = uncachedBits.Where(b => !existingBits.Contains(b) && !_floatCache.ContainsKey(b)).ToList();
 
         if (missing.Count == 0) return;
 
-        Logger?.LogDebug("Creating {Count:N0} new float atoms", missing.Count);
+        Logger?.LogDebug("Creating {Count:N0} new float constants", missing.Count);
 
-        // BATCH 2: Create all missing atoms
-        var newAtoms = new List<Atom>(missing.Count);
+        // BATCH 2: Create all missing constants
+        var newConstants = new List<Constant>(missing.Count);
         foreach (var bits in missing)
         {
             var baseHash = HartNative.ComputeSeedHash(bits);
-            var contentHash = ComputeTypedContentHash(baseHash, "float32");
+            var contentHash = ComputeTypedContentHash(baseHash, SEED_TYPE_FLOAT_BITS);
             var point = HartNative.project_seed_to_hypersphere(bits);
             var hilbert = HartNative.point_to_hilbert(point);
             var geom = GeometryFactory.CreatePoint(new CoordinateZM(point.X, point.Y, point.Z, point.M));
 
-            newAtoms.Add(new Atom
+            newConstants.Add(new Constant
             {
-                HilbertHigh = hilbert.High,
-                HilbertLow = hilbert.Low,
+                HilbertHigh = (ulong)hilbert.High,
+                HilbertLow = (ulong)hilbert.Low,
                 Geom = geom,
-                IsConstant = true,
                 SeedValue = bits,
                 SeedType = SEED_TYPE_FLOAT_BITS,
-                ContentHash = contentHash,
-                AtomType = "float32"
+                ContentHash = contentHash
             });
         }
 
         // Bulk insert
-        Context.Atoms.AddRange(newAtoms);
+        Context.Constants.AddRange(newConstants);
         await Context.SaveChangesAsync(ct);
 
         // Update cache with new IDs
         for (int i = 0; i < missing.Count; i++)
         {
-            _floatCache[missing[i]] = newAtoms[i].Id;
+            _floatCache[missing[i]] = newConstants[i].Id;
         }
 
         // Trim cache if too large
@@ -637,9 +644,9 @@ public class StreamingModelIngestionService : IngestionServiceBase
         var contentHash = HartNative.ComputeCompositionHash(refs, multiplicities);
 
         // Check for existing
-        var existing = await Context.Atoms
-            .Where(a => a.ContentHash == contentHash && !a.IsConstant)
-            .Select(a => a.Id)
+        var existing = await Context.Compositions
+            .Where(c => c.ContentHash == contentHash)
+            .Select(c => c.Id)
             .FirstOrDefaultAsync(ct);
 
         if (existing != 0) return existing;
@@ -651,18 +658,18 @@ public class StreamingModelIngestionService : IngestionServiceBase
             .Take(sampleSize)
             .ToList();
 
-        var sampleAtomIds = sampleIndices.Select(i => refs[i]).Distinct().ToArray();
-        var sampleAtoms = await Context.Atoms
-            .Where(a => sampleAtomIds.Contains(a.Id))
-            .ToDictionaryAsync(a => a.Id, ct);
+        var sampleConstantIds = sampleIndices.Select(i => refs[i]).Distinct().ToArray();
+        var sampleConstants = await Context.Constants
+            .Where(c => sampleConstantIds.Contains(c.Id))
+            .ToDictionaryAsync(c => c.Id, ct);
 
         double avgX = 0, avgY = 0, avgZ = 0, avgM = 0;
         int count = 0;
-        foreach (var atomId in sampleAtomIds)
+        foreach (var constantId in sampleConstantIds)
         {
-            if (sampleAtoms.TryGetValue(atomId, out var atom) && atom.Geom != null)
+            if (sampleConstants.TryGetValue(constantId, out var constant) && constant.Geom != null)
             {
-                var coord = atom.Geom.Centroid.Coordinate;
+                var coord = constant.Geom.Centroid.Coordinate;
                 avgX += coord.X;
                 avgY += coord.Y;
                 avgZ += double.IsNaN(coord.Z) ? 0 : coord.Z;
@@ -685,77 +692,80 @@ public class StreamingModelIngestionService : IngestionServiceBase
             X = avgX, Y = avgY, Z = avgZ, M = avgM
         });
 
-        var metadata = new
+        // Note: For model tensors, we store metadata as composition key-value pairs
+        // The model/tensor info is referenced via TypeId to a composition that encodes the metadata
+        // For now, we skip the metadata and just store the weights
+        
+        var tensorComposition = new Composition
         {
-            model = modelName,
-            tensor_name = tensorInfo.Name,
-            dtype = tensorInfo.DType,
-            shape = tensorInfo.Shape,
-            total_elements = tensorInfo.TotalElements
-        };
-
-        var tensorAtom = new Atom
-        {
-            HilbertHigh = hilbert.High,
-            HilbertLow = hilbert.Low,
+            HilbertHigh = (ulong)hilbert.High,
+            HilbertLow = (ulong)hilbert.Low,
             Geom = geom,
-            IsConstant = false,
-            Refs = refs,
-            Multiplicities = multiplicities,
-            ContentHash = contentHash,
-            AtomType = IsEmbeddingTensor(tensorInfo.Name) ? "model_embedding" : "model_weight",
-            Metadata = JsonSerializer.Serialize(metadata)
+            ContentHash = contentHash
         };
 
-        Context.Atoms.Add(tensorAtom);
+        Context.Compositions.Add(tensorComposition);
         await Context.SaveChangesAsync(ct);
 
-        return tensorAtom.Id;
+        // Create Relation entries for the tensor composition (linking to Constants)
+        for (int i = 0; i < refs.Length; i++)
+        {
+            Context.Relations.Add(new Relation
+            {
+                CompositionId = tensorComposition.Id,
+                ChildConstantId = refs[i],
+                Position = i,
+                Multiplicity = multiplicities[i]
+            });
+        }
+        await Context.SaveChangesAsync(ct);
+
+        return tensorComposition.Id;
     }
 
     /// <summary>
     /// Create SPARSE tensor composition - only stores significant weights.
-    /// Uses COO-style (index, atomId) pairs instead of dense array.
+    /// Uses COO-style (index, constantId) pairs instead of dense array.
     /// </summary>
     private async Task<long> CreateSparseTensorCompositionAsync(
-        List<(int index, long atomId)> sparseRefs,
+        List<(int index, long constantId)> sparseRefs,
         TensorInfo tensorInfo,
         string modelName,
         CancellationToken ct)
     {
-        // SPARSE: Store only the atom IDs (positions are metadata)
+        // SPARSE: Store only the constant IDs (positions are metadata)
         // The indices tell us WHERE in the original tensor each weight lives
-        var atomIds = sparseRefs.Select(r => r.atomId).ToArray();
+        var constantIds = sparseRefs.Select(r => r.constantId).ToArray();
         var indices = sparseRefs.Select(r => r.index).ToArray();
         
         // Multiplicities = 1 for each (no RLE, sparse storage does the compression)
-        var multiplicities = new int[atomIds.Length];
+        var multiplicities = new int[constantIds.Length];
         Array.Fill(multiplicities, 1);
 
-        var contentHash = HartNative.ComputeCompositionHash(atomIds, multiplicities);
+        var contentHash = HartNative.ComputeCompositionHash(constantIds, multiplicities);
 
         // Check for existing
-        var existing = await Context.Atoms
-            .Where(a => a.ContentHash == contentHash && !a.IsConstant)
-            .Select(a => a.Id)
+        var existing = await Context.Compositions
+            .Where(c => c.ContentHash == contentHash)
+            .Select(c => c.Id)
             .FirstOrDefaultAsync(ct);
 
         if (existing != 0) return existing;
 
         // Compute geometry from sample of stored weights
-        var sampleSize = Math.Min(100, atomIds.Length);
-        var sampleAtomIds = atomIds.Take(sampleSize).Distinct().ToArray();
-        var sampleAtoms = await Context.Atoms
-            .Where(a => sampleAtomIds.Contains(a.Id))
-            .ToDictionaryAsync(a => a.Id, ct);
+        var sampleSize = Math.Min(100, constantIds.Length);
+        var sampleConstantIds = constantIds.Take(sampleSize).Distinct().ToArray();
+        var sampleConstants = await Context.Constants
+            .Where(c => sampleConstantIds.Contains(c.Id))
+            .ToDictionaryAsync(c => c.Id, ct);
 
         double avgX = 0, avgY = 0, avgZ = 0, avgM = 0;
         int count = 0;
-        foreach (var atomId in sampleAtomIds)
+        foreach (var constantId in sampleConstantIds)
         {
-            if (sampleAtoms.TryGetValue(atomId, out var atom) && atom.Geom != null)
+            if (sampleConstants.TryGetValue(constantId, out var constant) && constant.Geom != null)
             {
-                var coord = atom.Geom.Centroid.Coordinate;
+                var coord = constant.Geom.Centroid.Coordinate;
                 avgX += coord.X;
                 avgY += coord.Y;
                 avgZ += double.IsNaN(coord.Z) ? 0 : coord.Z;
@@ -778,78 +788,75 @@ public class StreamingModelIngestionService : IngestionServiceBase
             X = avgX, Y = avgY, Z = avgZ, M = avgM
         });
 
-        // SPARSE METADATA: Store original shape + indices for reconstruction
-        var metadata = new
+        // SPARSE: For sparse tensors, the Position in Relation encodes the original tensor index
+        // This allows reconstruction of the full tensor with zeros in non-stored positions
+        
+        var tensorComposition = new Composition
         {
-            model = modelName,
-            tensor_name = tensorInfo.Name,
-            dtype = tensorInfo.DType,
-            shape = tensorInfo.Shape,
-            total_elements = tensorInfo.TotalElements,
-            sparse = true,
-            stored_count = atomIds.Length,
-            sparsity = 100.0 * (tensorInfo.TotalElements - atomIds.Length) / tensorInfo.TotalElements,
-            indices = indices // Store indices for reconstruction if needed
-        };
-
-        var tensorAtom = new Atom
-        {
-            HilbertHigh = hilbert.High,
-            HilbertLow = hilbert.Low,
+            HilbertHigh = (ulong)hilbert.High,
+            HilbertLow = (ulong)hilbert.Low,
             Geom = geom,
-            IsConstant = false,
-            Refs = atomIds,  // Only significant weights
-            Multiplicities = multiplicities,
-            ContentHash = contentHash,
-            AtomType = IsEmbeddingTensor(tensorInfo.Name) ? "sparse_embedding" : "sparse_weight",
-            Metadata = JsonSerializer.Serialize(metadata)
+            ContentHash = contentHash
         };
 
-        Context.Atoms.Add(tensorAtom);
+        Context.Compositions.Add(tensorComposition);
+        await Context.SaveChangesAsync(ct);
+
+        // Create Relation entries - Position stores the original tensor index
+        for (int i = 0; i < constantIds.Length; i++)
+        {
+            Context.Relations.Add(new Relation
+            {
+                CompositionId = tensorComposition.Id,
+                ChildConstantId = constantIds[i],
+                Position = indices[i], // Original tensor index for sparse reconstruction
+                Multiplicity = multiplicities[i]
+            });
+        }
         await Context.SaveChangesAsync(ct);
 
         Logger?.LogDebug(
             "Sparse tensor {Name}: {Stored:N0}/{Total:N0} values ({Sparsity:F1}% sparse)",
-            tensorInfo.Name, atomIds.Length, tensorInfo.TotalElements,
-            100.0 * (tensorInfo.TotalElements - atomIds.Length) / tensorInfo.TotalElements);
+            tensorInfo.Name, constantIds.Length, tensorInfo.TotalElements,
+            100.0 * (tensorInfo.TotalElements - constantIds.Length) / tensorInfo.TotalElements);
 
-        return tensorAtom.Id;
+        return tensorComposition.Id;
     }
 
     private async Task<long> CreateModelCompositionAsync(
-        long[] tensorAtomIds,
+        long[] tensorCompositionIds,
         string modelName,
         SafeTensorMetadata metadata,
         CancellationToken ct)
     {
-        var multiplicities = Enumerable.Repeat(1, tensorAtomIds.Length).ToArray();
-        var contentHash = HartNative.ComputeCompositionHash(tensorAtomIds, multiplicities);
+        var multiplicities = Enumerable.Repeat(1, tensorCompositionIds.Length).ToArray();
+        var contentHash = HartNative.ComputeCompositionHash(tensorCompositionIds, multiplicities);
 
-        var existing = await Context.Atoms
-            .Where(a => a.ContentHash == contentHash && !a.IsConstant)
-            .Select(a => a.Id)
+        var existing = await Context.Compositions
+            .Where(c => c.ContentHash == contentHash)
+            .Select(c => c.Id)
             .FirstOrDefaultAsync(ct);
 
         if (existing != 0) return existing;
 
-        // Sample geometry from child atoms
-        var sampleAtoms = await Context.Atoms
-            .Where(a => tensorAtomIds.Take(10).Contains(a.Id))
+        // Sample geometry from child compositions
+        var sampleCompositions = await Context.Compositions
+            .Where(c => tensorCompositionIds.Take(10).Contains(c.Id))
             .ToListAsync(ct);
 
         double avgX = 0, avgY = 0, avgZ = 0;
-        foreach (var atom in sampleAtoms.Where(a => a.Geom != null))
+        foreach (var composition in sampleCompositions.Where(c => c.Geom != null))
         {
-            var coord = atom.Geom!.Centroid.Coordinate;
+            var coord = composition.Geom!.Centroid.Coordinate;
             avgX += coord.X;
             avgY += coord.Y;
             avgZ += double.IsNaN(coord.Z) ? 0 : coord.Z;
         }
-        if (sampleAtoms.Count > 0)
+        if (sampleCompositions.Count > 0)
         {
-            avgX /= sampleAtoms.Count;
-            avgY /= sampleAtoms.Count;
-            avgZ /= sampleAtoms.Count;
+            avgX /= sampleCompositions.Count;
+            avgY /= sampleCompositions.Count;
+            avgZ /= sampleCompositions.Count;
         }
 
         var geom = GeometryFactory.CreatePoint(new CoordinateZM(avgX, avgY, avgZ, 0));
@@ -858,30 +865,33 @@ public class StreamingModelIngestionService : IngestionServiceBase
             X = avgX, Y = avgY, Z = avgZ, M = 0
         });
 
-        var modelMetadata = new
+        // Model composition - a composition of tensor compositions
+        // Model metadata can be stored as composition key-value pairs if needed
+        var modelComposition = new Composition
         {
-            model_name = modelName,
-            tensor_count = tensorAtomIds.Length,
-            safetensor_metadata = metadata.Metadata
-        };
-
-        var modelAtom = new Atom
-        {
-            HilbertHigh = hilbert.High,
-            HilbertLow = hilbert.Low,
+            HilbertHigh = (ulong)hilbert.High,
+            HilbertLow = (ulong)hilbert.Low,
             Geom = geom,
-            IsConstant = false,
-            Refs = tensorAtomIds,
-            Multiplicities = multiplicities,
-            ContentHash = contentHash,
-            AtomType = "ai_model",
-            Metadata = JsonSerializer.Serialize(modelMetadata)
+            ContentHash = contentHash
         };
 
-        Context.Atoms.Add(modelAtom);
+        Context.Compositions.Add(modelComposition);
         await Context.SaveChangesAsync(ct);
 
-        return modelAtom.Id;
+        // Create Relation entries for tensor compositions (linking to child Compositions)
+        for (int i = 0; i < tensorCompositionIds.Length; i++)
+        {
+            Context.Relations.Add(new Relation
+            {
+                CompositionId = modelComposition.Id,
+                ChildCompositionId = tensorCompositionIds[i],
+                Position = i,
+                Multiplicity = multiplicities[i]
+            });
+        }
+        await Context.SaveChangesAsync(ct);
+
+        return modelComposition.Id;
     }
 
     // ============================================
@@ -1019,7 +1029,7 @@ public class ModelIngestionProgress
 public class SparseModelIngestionResult
 {
     public string ModelName { get; set; } = "";
-    public long? RootAtomId { get; set; }
+    public long? RootCompositionId { get; set; }
     public int TensorCount { get; set; }
     public long TotalParameters { get; set; }
     public long ProcessingTimeMs { get; set; }
@@ -1046,12 +1056,12 @@ public class SparseModelIngestionResult
     public double SparsityPercent { get; set; }
     
     /// <summary>
-    /// Embedding tensors (for spatial queries).
+    /// Embedding tensor compositions (for spatial queries).
     /// </summary>
-    public Dictionary<string, long> EmbeddingAtomIds { get; } = new();
+    public Dictionary<string, long> EmbeddingCompositionIds { get; } = new();
     
     /// <summary>
-    /// Weight tensors (for relationship traversal).
+    /// Weight tensor compositions (for relationship traversal).
     /// </summary>
-    public Dictionary<string, long> WeightAtomIds { get; } = new();
+    public Dictionary<string, long> WeightCompositionIds { get; } = new();
 }

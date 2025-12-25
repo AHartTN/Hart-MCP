@@ -42,54 +42,71 @@ public class EmbeddingIngestionService : IngestionServiceBase, IIngestionService
         Logger?.LogDebug("Found {UniqueCount} unique float values", uniqueBits.Count);
 
         // ============================================
-        // PHASE 2: BULK create ALL component constants (ONE DB round-trip)
+        // PHASE 2: BULK create ALL component constants
         // ============================================
         var bitsLookup = await BulkGetOrCreateConstantsAsync(
             uniqueBits.ToArray(),
             SEED_TYPE_FLOAT_BITS,
-            null, // typeRef
             ct);
 
         // ============================================
         // PHASE 3: Build embedding composition using lookup
         // ============================================
-        var componentAtomIds = new long[embedding.Length];
+        var componentConstantIds = new long[embedding.Length];
         for (int i = 0; i < embedding.Length; i++)
         {
             uint bits = BitConverter.SingleToUInt32Bits(embedding[i]);
-            componentAtomIds[i] = bitsLookup[bits]; // O(1), NO DB
+            componentConstantIds[i] = bitsLookup[bits]; // O(1), NO DB
         }
 
-        // Create embedding composition
-        var embeddingId = await CreateCompositionAsync(
-            componentAtomIds,
-            Enumerable.Repeat(1, componentAtomIds.Length).ToArray(),
-            null, // typeRef
+        // Create embedding composition from constants
+        var embeddingId = await CreateCompositionFromConstantsAsync(
+            componentConstantIds,
+            Enumerable.Repeat(1, componentConstantIds.Length).ToArray(),
+            null, // typeId
             ct
         );
 
-        Logger?.LogInformation("Ingested embedding as atom {AtomId}", embeddingId);
+        Logger?.LogInformation("Ingested embedding as composition {CompositionId}", embeddingId);
         return embeddingId;
     }
 
     public async Task<float[]> ReconstructAsync(long compositionId, CancellationToken ct = default)
     {
-        var embedding = await Context.Atoms
-            .FirstOrDefaultAsync(a => a.Id == compositionId && !a.IsConstant, ct);
+        var embedding = await Context.Compositions
+            .FirstOrDefaultAsync(c => c.Id == compositionId, ct);
 
-        if (embedding?.Refs == null)
-            throw new InvalidOperationException($"Invalid embedding atom {compositionId}");
+        if (embedding == null)
+            throw new InvalidOperationException($"Invalid embedding composition {compositionId}");
 
-        var components = await Context.Atoms
-            .Where(a => embedding.Refs.Contains(a.Id) && a.IsConstant)
-            .ToDictionaryAsync(a => a.Id, ct);
+        // Get component relations via Relation table
+        var componentRelations = await Context.Relations
+            .Where(r => r.CompositionId == compositionId)
+            .OrderBy(r => r.Position)
+            .ToListAsync(ct);
 
-        var result = new float[embedding.Refs.Length];
+        if (componentRelations.Count == 0)
+            throw new InvalidOperationException($"Invalid embedding composition {compositionId} - no components");
 
-        for (int i = 0; i < embedding.Refs.Length; i++)
+        var constantIds = componentRelations
+            .Where(r => r.ChildConstantId.HasValue)
+            .Select(r => r.ChildConstantId!.Value)
+            .Distinct()
+            .ToList();
+        var constants = await Context.Constants
+            .Where(c => constantIds.Contains(c.Id))
+            .ToDictionaryAsync(c => c.Id, ct);
+
+        var result = new float[componentRelations.Count];
+
+        for (int i = 0; i < componentRelations.Count; i++)
         {
-            var component = components[embedding.Refs[i]];
-            uint bits = (uint)(component.SeedValue ?? 0);
+            var relation = componentRelations[i];
+            if (!relation.ChildConstantId.HasValue)
+                throw new InvalidOperationException($"Expected constant child at position {i}");
+
+            var constant = constants[relation.ChildConstantId.Value];
+            uint bits = (uint)constant.SeedValue;
             result[i] = BitConverter.UInt32BitsToSingle(bits);
         }
 
@@ -109,7 +126,7 @@ public class EmbeddingIngestionService : IngestionServiceBase, IIngestionService
 
         // For double precision, values are typically unique so we still process individually
         // (64-bit precision means deduplication is rare)
-        var componentAtomIds = new long[embedding.Length];
+        var componentConstantIds = new long[embedding.Length];
 
         for (int i = 0; i < embedding.Length; i++)
         {
@@ -117,17 +134,17 @@ public class EmbeddingIngestionService : IngestionServiceBase, IIngestionService
             ulong bits = BitConverter.DoubleToUInt64Bits(embedding[i]);
 
             // Store as 64-bit integer constant
-            componentAtomIds[i] = await GetOrCreateIntegerConstantAsync((long)bits, null, ct);
+            componentConstantIds[i] = await GetOrCreateConstantAsync((long)bits, SEED_TYPE_INTEGER, ct);
         }
 
-        var embeddingId = await CreateCompositionAsync(
-            componentAtomIds,
-            Enumerable.Repeat(1, componentAtomIds.Length).ToArray(),
-            null, // typeRef
+        var embeddingId = await CreateCompositionFromConstantsAsync(
+            componentConstantIds,
+            Enumerable.Repeat(1, componentConstantIds.Length).ToArray(),
+            null, // typeId
             ct
         );
 
-        Logger?.LogInformation("Ingested double embedding as atom {AtomId}", embeddingId);
+        Logger?.LogInformation("Ingested double embedding as composition {CompositionId}", embeddingId);
         return embeddingId;
     }
 
@@ -136,23 +153,62 @@ public class EmbeddingIngestionService : IngestionServiceBase, IIngestionService
     /// </summary>
     public async Task<double[]> ReconstructDoubleAsync(long compositionId, CancellationToken ct = default)
     {
-        var embedding = await Context.Atoms
-            .FirstOrDefaultAsync(a => a.Id == compositionId && !a.IsConstant, ct);
+        var embedding = await Context.Compositions
+            .FirstOrDefaultAsync(c => c.Id == compositionId, ct);
 
-        if (embedding?.Refs == null)
-            throw new InvalidOperationException($"Invalid embedding atom {compositionId}");
+        if (embedding == null)
+            throw new InvalidOperationException($"Invalid embedding composition {compositionId}");
 
-        var components = await Context.Atoms
-            .Where(a => embedding.Refs.Contains(a.Id) && a.IsConstant)
-            .ToDictionaryAsync(a => a.Id, ct);
+        // Get component relations via Relation table
+        var componentRelations = await Context.Relations
+            .Where(r => r.CompositionId == compositionId)
+            .OrderBy(r => r.Position)
+            .ToListAsync(ct);
 
-        var result = new double[embedding.Refs.Length];
+        if (componentRelations.Count == 0)
+            throw new InvalidOperationException($"Invalid embedding composition {compositionId} - no components");
 
-        for (int i = 0; i < embedding.Refs.Length; i++)
+        var constantIds = componentRelations
+            .Where(r => r.ChildConstantId.HasValue)
+            .Select(r => r.ChildConstantId!.Value)
+            .Distinct()
+            .ToList();
+        var constants = await Context.Constants
+            .Where(c => constantIds.Contains(c.Id))
+            .ToDictionaryAsync(c => c.Id, ct);
+
+        var result = new double[componentRelations.Count];
+
+        for (int i = 0; i < componentRelations.Count; i++)
         {
-            var component = components[embedding.Refs[i]];
-            ulong bits = (ulong)(component.SeedValue ?? 0);
+            var relation = componentRelations[i];
+            if (!relation.ChildConstantId.HasValue)
+                throw new InvalidOperationException($"Expected constant child at position {i}");
+
+            var constant = constants[relation.ChildConstantId.Value];
+            ulong bits = (ulong)constant.SeedValue;
             result[i] = BitConverter.UInt64BitsToDouble(bits);
+        }
+
+        return result;
+    }
+
+    /// <summary>
+    /// Bulk get or create constants for an array of seed values.
+    /// Returns a dictionary mapping seed values to constant IDs.
+    /// </summary>
+    private async Task<Dictionary<uint, long>> BulkGetOrCreateConstantsAsync(
+        uint[] seedValues,
+        int seedType,
+        CancellationToken ct)
+    {
+        var result = new Dictionary<uint, long>();
+
+        foreach (var seedValue in seedValues)
+        {
+            ct.ThrowIfCancellationRequested();
+            var constantId = await GetOrCreateConstantAsync(seedValue, seedType, ct);
+            result[seedValue] = constantId;
         }
 
         return result;

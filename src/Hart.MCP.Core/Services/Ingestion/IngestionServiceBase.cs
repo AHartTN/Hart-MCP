@@ -1,5 +1,4 @@
 using System.Security.Cryptography;
-using System.Text;
 using Hart.MCP.Core.Data;
 using Hart.MCP.Core.Entities;
 using Hart.MCP.Core.Native;
@@ -11,7 +10,7 @@ namespace Hart.MCP.Core.Services.Ingestion;
 
 /// <summary>
 /// Base class for all ingestion services.
-/// Provides common atom creation and deduplication logic.
+/// Uses Constant/Composition/Relation tables (no arrays).
 /// </summary>
 public abstract class IngestionServiceBase
 {
@@ -23,6 +22,9 @@ public abstract class IngestionServiceBase
     protected const int SEED_TYPE_UNICODE = 0;
     protected const int SEED_TYPE_INTEGER = 1;
     protected const int SEED_TYPE_FLOAT_BITS = 2;
+    protected const int SEED_TYPE_BYTE = 3;
+    protected const int SEED_TYPE_BOOLEAN = 4;  // JSON booleans - distinct from integers
+    protected const int SEED_TYPE_JSON_NULL = 5; // JSON null - distinct from other special values
 
     protected IngestionServiceBase(HartDbContext context, ILogger? logger = null)
     {
@@ -33,7 +35,6 @@ public abstract class IngestionServiceBase
 
     /// <summary>
     /// Compute content hash that includes seed hash and seed type.
-    /// SeedType ensures semantic differentiation (codepoint vs integer vs float).
     /// </summary>
     protected static byte[] ComputeTypedContentHash(byte[] seedHash, int seedType)
     {
@@ -46,47 +47,70 @@ public abstract class IngestionServiceBase
     }
 
     /// <summary>
-    /// Get or create a constant atom for a seed value.
+    /// Compute content hash for a composition, including child types.
+    /// This prevents collisions between compositions with same IDs but different child types.
+    /// </summary>
+    protected static byte[] ComputeCompositionContentHash(
+        (long id, bool isConstant)[] children,
+        int[] multiplicities)
+    {
+        using var sha256 = SHA256.Create();
+        
+        // Get base hash from native library
+        var childIds = children.Select(c => c.id).ToArray();
+        var baseHash = NativeLibrary.ComputeCompositionHash(childIds, multiplicities);
+        
+        // Add child type indicators to make hash unique based on constant vs composition
+        // Each child contributes 1 bit: 0 = composition, 1 = constant
+        var typeBytes = new byte[(children.Length + 7) / 8];
+        for (int i = 0; i < children.Length; i++)
+        {
+            if (children[i].isConstant)
+                typeBytes[i / 8] |= (byte)(1 << (i % 8));
+        }
+        
+        // Combine base hash with type bytes
+        var combined = new byte[baseHash.Length + typeBytes.Length];
+        baseHash.CopyTo(combined, 0);
+        typeBytes.CopyTo(combined, baseHash.Length);
+        
+        return sha256.ComputeHash(combined);
+    }
+
+    /// <summary>
+    /// Get or create a constant for a seed value.
     /// Automatically deduplicates via content hash.
-    /// Content hash includes seedType for semantic differentiation
-    /// (codepoint vs integer vs float bits).
     /// </summary>
     protected async Task<long> GetOrCreateConstantAsync(
-        uint seedValue,
+        long seedValue,
         int seedType,
-        long? typeRef = null,
         CancellationToken ct = default)
     {
-        // Content hash uses seedType for semantic differentiation
-        var baseHash = NativeLibrary.ComputeSeedHash(seedValue);
+        var baseHash = NativeLibrary.ComputeSeedHash((uint)seedValue);
         var contentHash = ComputeTypedContentHash(baseHash, seedType);
 
-        var existing = await Context.Atoms
-            .Where(a => a.ContentHash == contentHash && a.IsConstant)
-            .Select(a => a.Id)
+        var existing = await Context.Constants
+            .Where(c => c.ContentHash == contentHash)
+            .Select(c => c.Id)
             .FirstOrDefaultAsync(ct);
 
         if (existing != 0) return existing;
 
-        var point = NativeLibrary.project_seed_to_hypersphere(seedValue);
+        var point = NativeLibrary.project_seed_to_hypersphere((uint)seedValue);
         var hilbert = NativeLibrary.point_to_hilbert(point);
         var geom = GeometryFactory.CreatePoint(new CoordinateZM(point.X, point.Y, point.Z, point.M));
 
-        var atom = new Atom
+        var constant = new Constant
         {
-            HilbertHigh = hilbert.High,
-            HilbertLow = hilbert.Low,
-            Geom = geom,
-            IsConstant = true,
             SeedValue = seedValue,
             SeedType = seedType,
-            Refs = null,
-            Multiplicities = null,
             ContentHash = contentHash,
-            TypeRef = typeRef
+            HilbertHigh = (ulong)hilbert.High,
+            HilbertLow = (ulong)hilbert.Low,
+            Geom = geom
         };
 
-        Context.Atoms.Add(atom);
+        Context.Constants.Add(constant);
 
         try
         {
@@ -94,291 +118,190 @@ public abstract class IngestionServiceBase
         }
         catch (DbUpdateException ex) when (IsDuplicateKeyException(ex))
         {
-            Context.Entry(atom).State = EntityState.Detached;
-            existing = await Context.Atoms
-                .Where(a => a.ContentHash == contentHash && a.IsConstant)
-                .Select(a => a.Id)
+            Context.Entry(constant).State = EntityState.Detached;
+            existing = await Context.Constants
+                .Where(c => c.ContentHash == contentHash)
+                .Select(c => c.Id)
                 .FirstOrDefaultAsync(ct);
             if (existing != 0) return existing;
             throw;
         }
 
-        return atom.Id;
+        return constant.Id;
     }
 
     /// <summary>
-    /// Get or create a constant atom from a 64-bit integer seed.
-    /// Uses both high and low 32-bit parts for full precision.
+    /// Get or create a constant for a uint seed value.
     /// </summary>
-    protected async Task<long> GetOrCreateIntegerConstantAsync(
-        long value,
-        long? typeRef = null,
+    protected Task<long> GetOrCreateConstantAsync(
+        uint seedValue,
+        int seedType,
         CancellationToken ct = default)
-    {
-        // Use the low 32 bits as seed, store full value in SeedValue
-        uint seedLow = (uint)(value & 0xFFFFFFFF);
-        var baseHash = NativeLibrary.ComputeSeedHash(seedLow);
-
-        // For full 64-bit, we need to incorporate high bits into hash
-        var highSeed = (uint)((value >> 32) & 0xFFFFFFFF);
-        if (highSeed != 0 && value >= 0 || value < 0)
-        {
-            // For values that don't fit in 32 bits, create unique hash
-            baseHash = NativeLibrary.ComputeCompositionHash(
-                new long[] { seedLow, highSeed },
-                new int[] { 1, 1 }
-            );
-        }
-
-        // Use seedType for content hash differentiation
-        var contentHash = ComputeTypedContentHash(baseHash, SEED_TYPE_INTEGER);
-
-        var existing = await Context.Atoms
-            .Where(a => a.ContentHash == contentHash && a.IsConstant)
-            .Select(a => a.Id)
-            .FirstOrDefaultAsync(ct);
-
-        if (existing != 0) return existing;
-
-        var point = NativeLibrary.project_seed_to_hypersphere(seedLow);
-        var hilbert = NativeLibrary.point_to_hilbert(point);
-        var geom = GeometryFactory.CreatePoint(new CoordinateZM(point.X, point.Y, point.Z, point.M));
-
-        var atom = new Atom
-        {
-            HilbertHigh = hilbert.High,
-            HilbertLow = hilbert.Low,
-            Geom = geom,
-            IsConstant = true,
-            SeedValue = value,
-            SeedType = SEED_TYPE_INTEGER,
-            Refs = null,
-            Multiplicities = null,
-            ContentHash = contentHash,
-            TypeRef = typeRef
-        };
-
-        Context.Atoms.Add(atom);
-
-        try
-        {
-            await Context.SaveChangesAsync(ct);
-        }
-        catch (DbUpdateException ex) when (IsDuplicateKeyException(ex))
-        {
-            Context.Entry(atom).State = EntityState.Detached;
-            existing = await Context.Atoms
-                .Where(a => a.ContentHash == contentHash && a.IsConstant)
-                .Select(a => a.Id)
-                .FirstOrDefaultAsync(ct);
-            if (existing != 0) return existing;
-            throw;
-        }
-
-        return atom.Id;
-    }
+        => GetOrCreateConstantAsync((long)seedValue, seedType, ct);
 
     /// <summary>
-    /// Create a composition atom from child references.
-    /// Automatically deduplicates via content hash.
+    /// Create a composition from an ordered list of children.
+    /// Children can be constants or compositions.
     /// </summary>
     protected async Task<long> CreateCompositionAsync(
-        long[] refs,
+        (long id, bool isConstant)[] children,
         int[] multiplicities,
-        long? typeRef = null,
+        long? typeId = null,
         CancellationToken ct = default)
     {
-        if (refs == null || refs.Length == 0)
-            throw new ArgumentException("Refs cannot be empty", nameof(refs));
-        if (multiplicities == null || multiplicities.Length != refs.Length)
-            throw new ArgumentException("Multiplicities must match refs", nameof(multiplicities));
+        if (children.Length == 0)
+            throw new ArgumentException("Composition must have at least one child", nameof(children));
 
-        var contentHash = NativeLibrary.ComputeCompositionHash(refs, multiplicities);
+        if (children.Length != multiplicities.Length)
+            throw new ArgumentException("Children and multiplicities must have same length");
 
-        var existing = await Context.Atoms
-            .Where(a => a.ContentHash == contentHash && !a.IsConstant)
-            .Select(a => a.Id)
+        // Compute content hash from children
+        // Include child type (constant vs composition) to prevent collisions
+        var contentHash = ComputeCompositionContentHash(children, multiplicities);
+
+        var existing = await Context.Compositions
+            .Where(c => c.ContentHash == contentHash)
+            .Select(c => c.Id)
             .FirstOrDefaultAsync(ct);
 
         if (existing != 0) return existing;
 
-        var children = await Context.Atoms
-            .Where(a => refs.Contains(a.Id))
-            .ToDictionaryAsync(a => a.Id, ct);
+        // Compute geometry from children (centroid approach)
+        var (hilbert, geom) = await ComputeCompositionGeometryAsync(children, ct);
 
-        var coordinates = new List<CoordinateZM>();
-        foreach (var refId in refs)
+        var composition = new Composition
         {
-            if (!children.TryGetValue(refId, out var child))
-                throw new InvalidOperationException($"Referenced atom {refId} not found");
-            coordinates.Add(ExtractCoordinate(child.Geom));
-        }
-
-        Geometry geom = coordinates.Count == 1
-            ? GeometryFactory.CreatePoint(coordinates[0])
-            : GeometryFactory.CreateLineString(coordinates.ToArray());
-
-        var centroid = geom.Centroid.Coordinate;
-        var hilbert = NativeLibrary.point_to_hilbert(new NativeLibrary.PointZM
-        {
-            X = centroid.X,
-            Y = centroid.Y,
-            Z = double.IsNaN(centroid.Z) ? 0 : centroid.Z,
-            M = double.IsNaN(centroid.M) ? 0 : centroid.M
-        });
-
-        var composition = new Atom
-        {
-            HilbertHigh = hilbert.High,
-            HilbertLow = hilbert.Low,
-            Geom = geom,
-            IsConstant = false,
-            SeedValue = null,
-            SeedType = null,
-            Refs = refs,
-            Multiplicities = multiplicities,
             ContentHash = contentHash,
-            TypeRef = typeRef
+            HilbertHigh = (ulong)hilbert.High,
+            HilbertLow = (ulong)hilbert.Low,
+            Geom = geom,
+            TypeId = typeId
         };
 
-        Context.Atoms.Add(composition);
+        Context.Compositions.Add(composition);
+        await Context.SaveChangesAsync(ct);
 
-        try
+        // Create relations
+        for (int i = 0; i < children.Length; i++)
         {
-            await Context.SaveChangesAsync(ct);
-        }
-        catch (DbUpdateException ex) when (IsDuplicateKeyException(ex))
-        {
-            Context.Entry(composition).State = EntityState.Detached;
-            existing = await Context.Atoms
-                .Where(a => a.ContentHash == contentHash && !a.IsConstant)
-                .Select(a => a.Id)
-                .FirstOrDefaultAsync(ct);
-            if (existing != 0) return existing;
-            throw;
+            var (childId, isConstant) = children[i];
+            var relation = new Relation
+            {
+                CompositionId = composition.Id,
+                Position = i,
+                Multiplicity = multiplicities[i]
+            };
+
+            if (isConstant)
+                relation.ChildConstantId = childId;
+            else
+                relation.ChildCompositionId = childId;
+
+            Context.Relations.Add(relation);
         }
 
+        await Context.SaveChangesAsync(ct);
         return composition.Id;
     }
 
     /// <summary>
-    /// BULK get or create constants - queries DB ONCE for all existing,
-    /// then batch inserts all missing in ONE transaction.
-    /// Returns dictionary mapping seed value to atom ID.
+    /// Create a composition from constant children only.
     /// </summary>
-    protected async Task<Dictionary<uint, long>> BulkGetOrCreateConstantsAsync(
-        uint[] seedValues,
-        int seedType,
-        long? typeRef = null,
+    protected Task<long> CreateCompositionFromConstantsAsync(
+        long[] constantIds,
+        int[] multiplicities,
+        long? typeId = null,
         CancellationToken ct = default)
     {
-        var result = new Dictionary<uint, long>(seedValues.Length);
-
-        // Get unique seeds
-        var uniqueSeeds = seedValues.Distinct().ToArray();
-
-        // Convert to long array for query (SeedValue is stored as long?)
-        var seedsAsLong = uniqueSeeds.Select(s => (long)s).ToList();
-
-        // SINGLE QUERY: Get all existing constants by seed value and seedType
-        var existing = await Context.Atoms
-            .Where(a => a.IsConstant && a.SeedType == seedType && a.SeedValue.HasValue && seedsAsLong.Contains(a.SeedValue.Value))
-            .Select(a => new { a.Id, a.SeedValue })
-            .ToListAsync(ct);
-
-        // Map existing to result
-        foreach (var atom in existing)
-        {
-            if (atom.SeedValue.HasValue)
-            {
-                var seed = (uint)atom.SeedValue.Value;
-                result[seed] = atom.Id;
-            }
-        }
-
-        // Find missing seeds
-        var missingSeeds = uniqueSeeds.Where(s => !result.ContainsKey(s)).ToList();
-
-        if (missingSeeds.Count > 0)
-        {
-            // BATCH INSERT: Create all missing atoms
-            var newAtoms = new List<(uint Seed, Atom Atom)>();
-
-            foreach (var seed in missingSeeds)
-            {
-                var baseHash = NativeLibrary.ComputeSeedHash(seed);
-                var hash = ComputeTypedContentHash(baseHash, seedType);
-                var point = NativeLibrary.project_seed_to_hypersphere(seed);
-                var hilbert = NativeLibrary.point_to_hilbert(point);
-                var geom = GeometryFactory.CreatePoint(new CoordinateZM(point.X, point.Y, point.Z, point.M));
-
-                var atom = new Atom
-                {
-                    HilbertHigh = hilbert.High,
-                    HilbertLow = hilbert.Low,
-                    Geom = geom,
-                    IsConstant = true,
-                    SeedValue = seed,
-                    SeedType = seedType,
-                    ContentHash = hash,
-                    TypeRef = typeRef
-                };
-
-                Context.Atoms.Add(atom);
-                newAtoms.Add((seed, atom));
-            }
-
-            // ONE SaveChanges for all new atoms
-            await Context.SaveChangesAsync(ct);
-
-            // Map new atoms to result
-            foreach (var (seed, atom) in newAtoms)
-            {
-                result[seed] = atom.Id;
-            }
-        }
-
-        return result;
+        var children = constantIds.Select(id => (id, isConstant: true)).ToArray();
+        return CreateCompositionAsync(children, multiplicities, typeId, ct);
     }
 
     /// <summary>
-    /// Batch create constants for efficiency (legacy - uses per-item DB queries).
-    /// Use BulkGetOrCreateConstantsAsync for better performance.
+    /// Get the children of a composition in order.
     /// </summary>
-    protected async Task<long[]> BatchGetOrCreateConstantsAsync(
-        uint[] seedValues,
-        int seedType,
-        long? typeRef = null,
+    protected async Task<List<(long id, bool isConstant, int multiplicity)>> GetCompositionChildrenAsync(
+        long compositionId,
         CancellationToken ct = default)
     {
-        // Use the bulk method and map back to array
-        var dict = await BulkGetOrCreateConstantsAsync(seedValues, seedType, typeRef, ct);
-        var results = new long[seedValues.Length];
-        for (int i = 0; i < seedValues.Length; i++)
+        var relations = await Context.Relations
+            .Where(r => r.CompositionId == compositionId)
+            .OrderBy(r => r.Position)
+            .Select(r => new { r.ChildConstantId, r.ChildCompositionId, r.Multiplicity })
+            .ToListAsync(ct);
+
+        return relations.Select(r =>
         {
-            results[i] = dict[seedValues[i]];
+            if (r.ChildConstantId.HasValue)
+                return (r.ChildConstantId.Value, isConstant: true, r.Multiplicity);
+            else
+                return (r.ChildCompositionId!.Value, isConstant: false, r.Multiplicity);
+        }).ToList();
+    }
+
+    /// <summary>
+    /// Compute geometry for a composition from its children.
+    /// </summary>
+    private async Task<(NativeLibrary.HilbertIndex hilbert, Geometry geom)> ComputeCompositionGeometryAsync(
+        (long id, bool isConstant)[] children,
+        CancellationToken ct)
+    {
+        var constantIds = children.Where(c => c.isConstant).Select(c => c.id).ToArray();
+        var compositionIds = children.Where(c => !c.isConstant).Select(c => c.id).ToArray();
+
+        var constantGeoms = constantIds.Length > 0
+            ? await Context.Constants
+                .Where(c => constantIds.Contains(c.Id))
+                .Select(c => c.Geom)
+                .ToListAsync(ct)
+            : new List<Geometry?>();
+
+        var compositionGeoms = compositionIds.Length > 0
+            ? await Context.Compositions
+                .Where(c => compositionIds.Contains(c.Id))
+                .Select(c => c.Geom)
+                .ToListAsync(ct)
+            : new List<Geometry?>();
+
+        var allGeoms = constantGeoms.Concat(compositionGeoms)
+            .Where(g => g != null)
+            .ToList();
+
+        if (allGeoms.Count == 0)
+        {
+            var defaultPoint = GeometryFactory.CreatePoint(new CoordinateZM(0, 0, 0, 0));
+            var defaultHilbert = NativeLibrary.point_to_hilbert(new NativeLibrary.PointZM { X = 0, Y = 0, Z = 0, M = 0 });
+            return (defaultHilbert, defaultPoint);
         }
-        return results;
+
+        // Compute centroid
+        double avgX = 0, avgY = 0, avgZ = 0, avgM = 0;
+        foreach (var g in allGeoms)
+        {
+            var coord = g!.Centroid.Coordinate;
+            avgX += coord.X;
+            avgY += coord.Y;
+            avgZ += double.IsNaN(coord.Z) ? 0 : coord.Z;
+            avgM += double.IsNaN(coord.M) ? 0 : coord.M;
+        }
+
+        avgX /= allGeoms.Count;
+        avgY /= allGeoms.Count;
+        avgZ /= allGeoms.Count;
+        avgM /= allGeoms.Count;
+
+        var centroid = GeometryFactory.CreatePoint(new CoordinateZM(avgX, avgY, avgZ, avgM));
+        var hilbert = NativeLibrary.point_to_hilbert(new NativeLibrary.PointZM
+        {
+            X = avgX, Y = avgY, Z = avgZ, M = avgM
+        });
+
+        return (hilbert, centroid);
     }
 
-    private static CoordinateZM ExtractCoordinate(Geometry geom)
+    protected static bool IsDuplicateKeyException(DbUpdateException ex)
     {
-        var coord = geom is Point p ? p.Coordinate : geom.Centroid.Coordinate;
-        return new CoordinateZM(
-            coord.X,
-            coord.Y,
-            double.IsNaN(coord.Z) ? 0 : coord.Z,
-            double.IsNaN(coord.M) ? 0 : coord.M
-        );
-    }
-
-    private static bool IsDuplicateKeyException(DbUpdateException ex)
-    {
-        return ex.InnerException?.Message.Contains("23505") == true
-            || ex.InnerException?.Message.Contains("duplicate key") == true;
+        return ex.InnerException?.Message.Contains("duplicate key", StringComparison.OrdinalIgnoreCase) == true
+            || ex.InnerException?.Message.Contains("unique constraint", StringComparison.OrdinalIgnoreCase) == true;
     }
 }
-
-/// <summary>
-/// Comparer for using byte arrays as dictionary keys.
-

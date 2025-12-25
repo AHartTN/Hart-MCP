@@ -121,41 +121,36 @@ public class IngestController : ControllerBase
     /// <summary>
     /// Get atom details by ID
     /// </summary>
-    /// <param name="atomId">The atom ID</param>
+    /// <param name="compositionId">The composition ID</param>
     /// <param name="cancellationToken">Cancellation token</param>
-    /// <returns>The atom details</returns>
-    [HttpGet("atom/{atomId:long}")]
-    [ProducesResponseType(typeof(AtomResponse), StatusCodes.Status200OK)]
+    /// <returns>The composition details</returns>
+    [HttpGet("atom/{compositionId:long}")]
+    [ProducesResponseType(typeof(CompositionResponse), StatusCodes.Status200OK)]
     [ProducesResponseType(typeof(ErrorResponse), StatusCodes.Status404NotFound)]
-    public async Task<IActionResult> GetAtom(long atomId, CancellationToken cancellationToken)
+    public async Task<IActionResult> GetAtom(long compositionId, CancellationToken cancellationToken)
     {
-        if (atomId <= 0)
-            return BadRequest(new ErrorResponse("Invalid atom ID"));
+        if (compositionId <= 0)
+            return BadRequest(new ErrorResponse("Invalid composition ID"));
 
         try
         {
-            var atom = await _ingestionService.GetAtomAsync(atomId, cancellationToken);
+            var composition = await _ingestionService.GetCompositionAsync(compositionId, cancellationToken);
             
-            if (atom == null)
-                return NotFound(new ErrorResponse($"Atom {atomId} not found"));
+            if (composition == null)
+                return NotFound(new ErrorResponse($"Composition {compositionId} not found"));
 
-            return Ok(new AtomResponse(
-                atom.Id,
-                atom.IsConstant,
-                atom.AtomType,
-                atom.SeedValue,
-                atom.SeedType,
-                atom.Refs?.Length ?? 0,
-                atom.HilbertHigh,
-                atom.HilbertLow,
-                Convert.ToHexString(atom.ContentHash),
-                atom.CreatedAt
+            return Ok(new CompositionResponse(
+                composition.Id,
+                composition.TypeId?.ToString(),
+                (long)composition.HilbertHigh,
+                (long)composition.HilbertLow,
+                Convert.ToHexString(composition.ContentHash)
             ));
         }
         catch (Exception ex)
         {
-            _logger.LogError(ex, "Failed to get atom {AtomId}", atomId);
-            return StatusCode(500, new ErrorResponse("An error occurred while retrieving atom", ex.Message));
+            _logger.LogError(ex, "Failed to get composition {CompositionId}", compositionId);
+            return StatusCode(500, new ErrorResponse("An error occurred while retrieving composition", ex.Message));
         }
     }
 }
@@ -181,17 +176,12 @@ public record ReconstructTextResponse(
     string Status
 );
 
-public record AtomResponse(
+public record CompositionResponse(
     long Id,
-    bool IsConstant,
-    string? AtomType,
-    long? SeedValue,
-    int? SeedType,
-    int RefCount,
+    string? TypeId,
     long HilbertHigh,
     long HilbertLow,
-    string ContentHash,
-    DateTime CreatedAt
+    string ContentHash
 );
 
 public record ErrorResponse(string Error, params string[] Details);

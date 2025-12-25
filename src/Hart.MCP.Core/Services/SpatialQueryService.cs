@@ -16,6 +16,11 @@ public class SpatialQueryService
     private readonly HartDbContext _context;
     private readonly ILogger<SpatialQueryService>? _logger;
 
+    /// <summary>
+    /// Exposes the database context for advanced queries
+    /// </summary>
+    public HartDbContext Context => _context;
+
     public SpatialQueryService(HartDbContext context, ILogger<SpatialQueryService>? logger = null)
     {
         _context = context ?? throw new ArgumentNullException(nameof(context));
@@ -23,10 +28,10 @@ public class SpatialQueryService
     }
 
     /// <summary>
-    /// Find nearest neighbors in 4D hypersphere space
-    /// Returns atoms spatially close to the given seed
+    /// Find nearest neighbor constants in 4D hypersphere space
+    /// Returns constants spatially close to the given seed
     /// </summary>
-    public async Task<List<Atom>> FindNearestNeighborsAsync(
+    public async Task<List<Constant>> FindNearestNeighborsAsync(
         uint seed, 
         int limit = 10, 
         CancellationToken cancellationToken = default)
@@ -40,10 +45,10 @@ public class SpatialQueryService
 
         _logger?.LogDebug("Finding {Limit} nearest neighbors to seed {Seed}", limit, seed);
 
-        var results = await _context.Atoms
+        var results = await _context.Constants
             .AsNoTracking()
-            .Where(a => a.IsConstant)
-            .OrderBy(a => a.Geom.Distance(geom))
+            .Where(c => c.Geom != null)
+            .OrderBy(c => c.Geom!.Distance(geom))
             .Take(limit)
             .ToListAsync(cancellationToken);
 
@@ -51,29 +56,29 @@ public class SpatialQueryService
     }
 
     /// <summary>
-    /// Find atoms within Hilbert range (locality-preserving range query)
+    /// Find constants within Hilbert range (locality-preserving range query)
     /// </summary>
-    public async Task<List<Atom>> FindInHilbertRangeAsync(
-        long hilbertHighStart, long hilbertLowStart,
-        long hilbertHighEnd, long hilbertLowEnd,
+    public async Task<List<Constant>> FindConstantsInHilbertRangeAsync(
+        ulong hilbertHighStart, ulong hilbertLowStart,
+        ulong hilbertHighEnd, ulong hilbertLowEnd,
         int limit = 100,
         CancellationToken cancellationToken = default)
     {
         if (limit <= 0 || limit > 10000)
             throw new ArgumentOutOfRangeException(nameof(limit), "Limit must be between 1 and 10000");
 
-        _logger?.LogDebug("Finding atoms in Hilbert range [{StartH}:{StartL}] to [{EndH}:{EndL}]",
+        _logger?.LogDebug("Finding constants in Hilbert range [{StartH}:{StartL}] to [{EndH}:{EndL}]",
             hilbertHighStart, hilbertLowStart, hilbertHighEnd, hilbertLowEnd);
 
-        var results = await _context.Atoms
+        var results = await _context.Constants
             .AsNoTracking()
-            .Where(a =>
-                (a.HilbertHigh > hilbertHighStart ||
-                 (a.HilbertHigh == hilbertHighStart && a.HilbertLow >= hilbertLowStart)) &&
-                (a.HilbertHigh < hilbertHighEnd ||
-                 (a.HilbertHigh == hilbertHighEnd && a.HilbertLow <= hilbertLowEnd)))
-            .OrderBy(a => a.HilbertHigh)
-            .ThenBy(a => a.HilbertLow)
+            .Where(c =>
+                (c.HilbertHigh > hilbertHighStart ||
+                 (c.HilbertHigh == hilbertHighStart && c.HilbertLow >= hilbertLowStart)) &&
+                (c.HilbertHigh < hilbertHighEnd ||
+                 (c.HilbertHigh == hilbertHighEnd && c.HilbertLow <= hilbertLowEnd)))
+            .OrderBy(c => c.HilbertHigh)
+            .ThenBy(c => c.HilbertLow)
             .Take(limit)
             .ToListAsync(cancellationToken);
 
@@ -81,9 +86,39 @@ public class SpatialQueryService
     }
 
     /// <summary>
-    /// Find atoms within geometric bounding box
+    /// Find compositions within Hilbert range (locality-preserving range query)
     /// </summary>
-    public async Task<List<Atom>> FindInBoundingBoxAsync(
+    public async Task<List<Composition>> FindCompositionsInHilbertRangeAsync(
+        ulong hilbertHighStart, ulong hilbertLowStart,
+        ulong hilbertHighEnd, ulong hilbertLowEnd,
+        int limit = 100,
+        CancellationToken cancellationToken = default)
+    {
+        if (limit <= 0 || limit > 10000)
+            throw new ArgumentOutOfRangeException(nameof(limit), "Limit must be between 1 and 10000");
+
+        _logger?.LogDebug("Finding compositions in Hilbert range [{StartH}:{StartL}] to [{EndH}:{EndL}]",
+            hilbertHighStart, hilbertLowStart, hilbertHighEnd, hilbertLowEnd);
+
+        var results = await _context.Compositions
+            .AsNoTracking()
+            .Where(c =>
+                (c.HilbertHigh > hilbertHighStart ||
+                 (c.HilbertHigh == hilbertHighStart && c.HilbertLow >= hilbertLowStart)) &&
+                (c.HilbertHigh < hilbertHighEnd ||
+                 (c.HilbertHigh == hilbertHighEnd && c.HilbertLow <= hilbertLowEnd)))
+            .OrderBy(c => c.HilbertHigh)
+            .ThenBy(c => c.HilbertLow)
+            .Take(limit)
+            .ToListAsync(cancellationToken);
+
+        return results;
+    }
+
+    /// <summary>
+    /// Find constants within geometric bounding box
+    /// </summary>
+    public async Task<List<Constant>> FindConstantsInBoundingBoxAsync(
         double xMin, double yMin, double zMin, double mMin,
         double xMax, double yMax, double zMax, double mMax,
         int limit = 100,
@@ -96,12 +131,12 @@ public class SpatialQueryService
         var envelope = new Envelope(xMin, xMax, yMin, yMax);
         var bbox = factory.ToGeometry(envelope);
 
-        _logger?.LogDebug("Finding atoms in bounding box ({XMin},{YMin}) to ({XMax},{YMax})",
+        _logger?.LogDebug("Finding constants in bounding box ({XMin},{YMin}) to ({XMax},{YMax})",
             xMin, yMin, xMax, yMax);
 
-        var results = await _context.Atoms
+        var results = await _context.Constants
             .AsNoTracking()
-            .Where(a => a.Geom.Intersects(bbox))
+            .Where(c => c.Geom != null && c.Geom.Intersects(bbox))
             .Take(limit)
             .ToListAsync(cancellationToken);
 
@@ -109,24 +144,88 @@ public class SpatialQueryService
     }
 
     /// <summary>
-    /// Find atoms that reference a specific atom (backlink traversal)
+    /// Find compositions within geometric bounding box
     /// </summary>
-    public async Task<List<Atom>> FindReferencingAtomsAsync(
-        long atomId, 
+    public async Task<List<Composition>> FindCompositionsInBoundingBoxAsync(
+        double xMin, double yMin, double zMin, double mMin,
+        double xMax, double yMax, double zMax, double mMax,
         int limit = 100,
         CancellationToken cancellationToken = default)
     {
-        if (atomId <= 0)
-            throw new ArgumentOutOfRangeException(nameof(atomId), "Atom ID must be positive");
         if (limit <= 0 || limit > 10000)
             throw new ArgumentOutOfRangeException(nameof(limit), "Limit must be between 1 and 10000");
 
-        _logger?.LogDebug("Finding atoms referencing atom {AtomId}", atomId);
+        var factory = new GeometryFactory(new PrecisionModel(), 0);
+        var envelope = new Envelope(xMin, xMax, yMin, yMax);
+        var bbox = factory.ToGeometry(envelope);
 
-        var results = await _context.Atoms
+        _logger?.LogDebug("Finding compositions in bounding box ({XMin},{YMin}) to ({XMax},{YMax})",
+            xMin, yMin, xMax, yMax);
+
+        var results = await _context.Compositions
             .AsNoTracking()
-            .Where(a => !a.IsConstant && a.Refs != null && a.Refs.Contains(atomId))
+            .Where(c => c.Geom != null && c.Geom.Intersects(bbox))
             .Take(limit)
+            .ToListAsync(cancellationToken);
+
+        return results;
+    }
+
+    /// <summary>
+    /// Find compositions that reference a specific constant (backlink traversal)
+    /// </summary>
+    public async Task<List<Composition>> FindCompositionsReferencingConstantAsync(
+        long constantId, 
+        int limit = 100,
+        CancellationToken cancellationToken = default)
+    {
+        if (constantId <= 0)
+            throw new ArgumentOutOfRangeException(nameof(constantId), "Constant ID must be positive");
+        if (limit <= 0 || limit > 10000)
+            throw new ArgumentOutOfRangeException(nameof(limit), "Limit must be between 1 and 10000");
+
+        _logger?.LogDebug("Finding compositions referencing constant {ConstantId}", constantId);
+
+        var parentIds = await _context.Relations
+            .Where(r => r.ChildConstantId == constantId)
+            .Select(r => r.CompositionId)
+            .Distinct()
+            .Take(limit)
+            .ToListAsync(cancellationToken);
+
+        var results = await _context.Compositions
+            .AsNoTracking()
+            .Where(c => parentIds.Contains(c.Id))
+            .ToListAsync(cancellationToken);
+
+        return results;
+    }
+
+    /// <summary>
+    /// Find compositions that reference a specific composition (backlink traversal)
+    /// </summary>
+    public async Task<List<Composition>> FindCompositionsReferencingCompositionAsync(
+        long compositionId, 
+        int limit = 100,
+        CancellationToken cancellationToken = default)
+    {
+        if (compositionId <= 0)
+            throw new ArgumentOutOfRangeException(nameof(compositionId), "Composition ID must be positive");
+        if (limit <= 0 || limit > 10000)
+            throw new ArgumentOutOfRangeException(nameof(limit), "Limit must be between 1 and 10000");
+
+        _logger?.LogDebug("Finding compositions referencing composition {CompositionId}", compositionId);
+
+        var parentIds = await _context.Relations
+            .Where(r => r.ChildCompositionId == compositionId)
+            .Select(r => r.CompositionId)
+            .Distinct()
+            .Take(limit)
+            .ToListAsync(cancellationToken);
+
+        var results = await _context.Compositions
+            .AsNoTracking()
+            .Where(c => parentIds.Contains(c.Id))
             .ToListAsync(cancellationToken);
 
         return results;
@@ -135,7 +234,7 @@ public class SpatialQueryService
     /// <summary>
     /// Find similar compositions using geometric similarity
     /// </summary>
-    public async Task<List<Atom>> FindSimilarCompositionsAsync(
+    public async Task<List<Composition>> FindSimilarCompositionsAsync(
         long compositionId, 
         int limit = 10,
         CancellationToken cancellationToken = default)
@@ -145,9 +244,9 @@ public class SpatialQueryService
         if (limit <= 0 || limit > 1000)
             throw new ArgumentOutOfRangeException(nameof(limit), "Limit must be between 1 and 1000");
 
-        var target = await _context.Atoms
+        var target = await _context.Compositions
             .AsNoTracking()
-            .Where(a => a.Id == compositionId && !a.IsConstant)
+            .Where(c => c.Id == compositionId)
             .FirstOrDefaultAsync(cancellationToken);
 
         if (target == null)
@@ -155,10 +254,10 @@ public class SpatialQueryService
 
         _logger?.LogDebug("Finding compositions similar to {CompositionId}", compositionId);
 
-        var results = await _context.Atoms
+        var results = await _context.Compositions
             .AsNoTracking()
-            .Where(a => !a.IsConstant && a.Id != compositionId)
-            .OrderBy(a => a.Geom.Distance(target.Geom))
+            .Where(c => c.Id != compositionId && c.Geom != null && target.Geom != null)
+            .OrderBy(c => c.Geom!.Distance(target.Geom!))
             .Take(limit)
             .ToListAsync(cancellationToken);
 
@@ -176,28 +275,41 @@ public class SpatialQueryService
         if (compositionA <= 0 || compositionB <= 0)
             throw new ArgumentOutOfRangeException("Composition IDs must be positive");
 
-        var atomA = await _context.Atoms
+        var compA = await _context.Compositions
             .AsNoTracking()
-            .FirstOrDefaultAsync(a => a.Id == compositionA, cancellationToken);
-        var atomB = await _context.Atoms
+            .FirstOrDefaultAsync(c => c.Id == compositionA, cancellationToken);
+        var compB = await _context.Compositions
             .AsNoTracking()
-            .FirstOrDefaultAsync(a => a.Id == compositionB, cancellationToken);
+            .FirstOrDefaultAsync(c => c.Id == compositionB, cancellationToken);
 
-        if (atomA == null)
+        if (compA == null)
             throw new InvalidOperationException($"Composition {compositionA} not found");
-        if (atomB == null)
+        if (compB == null)
             throw new InvalidOperationException($"Composition {compositionB} not found");
-        if (atomA.Refs == null || atomB.Refs == null)
-            throw new InvalidOperationException("Both compositions must have refs");
 
-        var refsA = atomA.Refs.ToHashSet();
-        var refsB = atomB.Refs.ToHashSet();
+        // Get child IDs from Relation table (both constant and composition children)
+        var refsA = await _context.Relations
+            .Where(r => r.CompositionId == compositionA)
+            .Select(r => r.ChildConstantId ?? r.ChildCompositionId ?? 0)
+            .Where(id => id != 0)
+            .ToListAsync(cancellationToken);
+        var refsB = await _context.Relations
+            .Where(r => r.CompositionId == compositionB)
+            .Select(r => r.ChildConstantId ?? r.ChildCompositionId ?? 0)
+            .Where(id => id != 0)
+            .ToListAsync(cancellationToken);
+
+        if (refsA.Count == 0 || refsB.Count == 0)
+            throw new InvalidOperationException("Both compositions must have relations");
+
+        var setA = refsA.ToHashSet();
+        var setB = refsB.ToHashSet();
 
         return new CompositionDifference
         {
-            OnlyInA = refsA.Except(refsB).ToList(),
-            OnlyInB = refsB.Except(refsA).ToList(),
-            Shared = refsA.Intersect(refsB).ToList()
+            OnlyInA = setA.Except(setB).ToList(),
+            OnlyInB = setB.Except(setA).ToList(),
+            Shared = setA.Intersect(setB).ToList()
         };
     }
 
@@ -211,79 +323,83 @@ public class SpatialQueryService
         if (compositionId <= 0)
             throw new ArgumentOutOfRangeException(nameof(compositionId), "Composition ID must be positive");
 
-        var composition = await _context.Atoms
+        var composition = await _context.Compositions
             .AsNoTracking()
-            .Where(a => a.Id == compositionId && !a.IsConstant)
+            .Where(c => c.Id == compositionId)
             .FirstOrDefaultAsync(cancellationToken);
 
         if (composition == null)
             throw new InvalidOperationException($"Composition {compositionId} not found");
 
-        if (composition.Refs == null)
-            throw new InvalidOperationException($"Composition {compositionId} has no refs");
-
-        var refStats = await _context.Atoms
-            .AsNoTracking()
-            .Where(a => composition.Refs.Contains(a.Id))
-            .GroupBy(a => a.IsConstant)
-            .Select(g => new { IsConstant = g.Key, Count = g.Count() })
+        // Get relations from Relation table
+        var relations = await _context.Relations
+            .Where(r => r.CompositionId == compositionId)
             .ToListAsync(cancellationToken);
 
-        var centroid = composition.Geom.Centroid;
+        if (relations.Count == 0)
+            throw new InvalidOperationException($"Composition {compositionId} has no relations");
+
+        var constantChildCount = relations.Count(r => r.ChildConstantId != null);
+        var compositionChildCount = relations.Count(r => r.ChildCompositionId != null);
+        var uniqueConstants = relations.Where(r => r.ChildConstantId != null).Select(r => r.ChildConstantId).Distinct().Count();
+        var uniqueCompositions = relations.Where(r => r.ChildCompositionId != null).Select(r => r.ChildCompositionId).Distinct().Count();
+
+        var centroid = composition.Geom?.Centroid;
 
         return new CompositionStats
         {
             Id = compositionId,
-            RefCount = composition.Refs.Length,
-            UniqueRefs = composition.Refs.Distinct().Count(),
-            TotalMultiplicity = composition.Multiplicities?.Sum() ?? 0,
-            GeometryType = composition.Geom.GeometryType,
-            GeometryLength = composition.Geom.Length,
-            CentroidX = centroid.X,
-            CentroidY = centroid.Y,
-            CentroidZ = centroid.Coordinate.Z,
-            CentroidM = centroid.Coordinate.M,
-            ConstantsReferenced = refStats.FirstOrDefault(r => r.IsConstant)?.Count ?? 0,
-            CompositionsReferenced = refStats.FirstOrDefault(r => !r.IsConstant)?.Count ?? 0
+            RefCount = relations.Count,
+            UniqueRefs = uniqueConstants + uniqueCompositions,
+            TotalMultiplicity = relations.Sum(r => r.Multiplicity),
+            GeometryType = composition.Geom?.GeometryType ?? "None",
+            GeometryLength = composition.Geom?.Length ?? 0,
+            CentroidX = centroid?.X ?? 0,
+            CentroidY = centroid?.Y ?? 0,
+            CentroidZ = centroid?.Coordinate.Z ?? 0,
+            CentroidM = centroid?.Coordinate.M ?? 0,
+            ConstantsReferenced = uniqueConstants,
+            CompositionsReferenced = uniqueCompositions
         };
     }
 
     /// <summary>
-    /// Search atoms by type
+    /// Search compositions by type ID
     /// </summary>
-    public async Task<List<Atom>> FindByTypeAsync(
-        string atomType,
+    public async Task<List<Composition>> FindByTypeIdAsync(
+        long typeId,
         int limit = 100,
         CancellationToken cancellationToken = default)
     {
-        if (string.IsNullOrWhiteSpace(atomType))
-            throw new ArgumentException("Atom type cannot be empty", nameof(atomType));
+        if (typeId <= 0)
+            throw new ArgumentOutOfRangeException(nameof(typeId), "Type ID must be positive");
         if (limit <= 0 || limit > 10000)
             throw new ArgumentOutOfRangeException(nameof(limit), "Limit must be between 1 and 10000");
 
-        return await _context.Atoms
+        return await _context.Compositions
             .AsNoTracking()
-            .Where(a => a.AtomType == atomType)
-            .OrderByDescending(a => a.CreatedAt)
+            .Where(c => c.TypeId == typeId)
             .Take(limit)
             .ToListAsync(cancellationToken);
     }
 
     /// <summary>
-    /// Get total atom counts
+    /// Get total counts for constants and compositions
     /// </summary>
-    public async Task<AtomCounts> GetAtomCountsAsync(CancellationToken cancellationToken = default)
+    public async Task<NodeCounts> GetNodeCountsAsync(CancellationToken cancellationToken = default)
     {
-        var counts = await _context.Atoms
+        var constantCount = await _context.Constants
             .AsNoTracking()
-            .GroupBy(a => a.IsConstant)
-            .Select(g => new { IsConstant = g.Key, Count = g.Count() })
-            .ToListAsync(cancellationToken);
+            .CountAsync(cancellationToken);
 
-        return new AtomCounts
+        var compositionCount = await _context.Compositions
+            .AsNoTracking()
+            .CountAsync(cancellationToken);
+
+        return new NodeCounts
         {
-            TotalConstants = counts.FirstOrDefault(c => c.IsConstant)?.Count ?? 0,
-            TotalCompositions = counts.FirstOrDefault(c => !c.IsConstant)?.Count ?? 0
+            TotalConstants = constantCount,
+            TotalCompositions = compositionCount
         };
     }
 }
@@ -312,7 +428,7 @@ public class CompositionStats
     public int CompositionsReferenced { get; set; }
 }
 
-public class AtomCounts
+public class NodeCounts
 {
     public int TotalConstants { get; set; }
     public int TotalCompositions { get; set; }

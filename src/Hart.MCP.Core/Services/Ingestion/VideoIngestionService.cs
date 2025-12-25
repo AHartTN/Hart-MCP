@@ -50,22 +50,21 @@ public class VideoIngestionService : IngestionServiceBase, IIngestionService<Vid
             uniquePixels.Count, video.Frames.Count);
 
         // ============================================
-        // PHASE 2: BULK create ALL pixel constants (ONE DB round-trip)
+        // PHASE 2: BULK create ALL pixel constants
         // ============================================
         var pixelLookup = await BulkGetOrCreateConstantsAsync(
             uniquePixels.ToArray(),
             SEED_TYPE_INTEGER,
-            null,
             ct);
 
         // ============================================
         // PHASE 3: Build frame compositions (using lookup, minimal DB ops)
         // ============================================
-        var frameAtomIds = new long[video.Frames.Count];
+        var frameCompositionIds = new long[video.Frames.Count];
 
         for (int f = 0; f < video.Frames.Count; f++)
         {
-            frameAtomIds[f] = await IngestFrameAsync(video.Frames[f], video.Width, video.Height, pixelLookup, ct);
+            frameCompositionIds[f] = await IngestFrameAsync(video.Frames[f], video.Width, video.Height, pixelLookup, ct);
             
             if (f > 0 && f % 100 == 0)
             {
@@ -76,37 +75,44 @@ public class VideoIngestionService : IngestionServiceBase, IIngestionService<Vid
         // ============================================
         // PHASE 4: Create video track composition
         // ============================================
+        var frameChildren = frameCompositionIds.Select(id => (id, isConstant: false)).ToArray();
         var trackId = await CreateCompositionAsync(
-            frameAtomIds,
-            Enumerable.Repeat(1, frameAtomIds.Length).ToArray(),
+            frameChildren,
+            Enumerable.Repeat(1, frameCompositionIds.Length).ToArray(),
             null,
             ct
         );
 
         // Store metadata as composition: [track, width, height, fps, frameCount, ?audio]
-        var widthAtom = await GetOrCreateConstantAsync((uint)video.Width, SEED_TYPE_INTEGER, null, ct);
-        var heightAtom = await GetOrCreateConstantAsync((uint)video.Height, SEED_TYPE_INTEGER, null, ct);
-        var fpsAtom = await GetOrCreateConstantAsync((uint)(video.FrameRate * 1000), SEED_TYPE_INTEGER, null, ct);
-        var frameCountAtom = await GetOrCreateConstantAsync((uint)video.Frames.Count, SEED_TYPE_INTEGER, null, ct);
+        var widthConstant = await GetOrCreateConstantAsync((uint)video.Width, SEED_TYPE_INTEGER, ct);
+        var heightConstant = await GetOrCreateConstantAsync((uint)video.Height, SEED_TYPE_INTEGER, ct);
+        var fpsConstant = await GetOrCreateConstantAsync((uint)(video.FrameRate * 1000), SEED_TYPE_INTEGER, ct);
+        var frameCountConstant = await GetOrCreateConstantAsync((uint)video.Frames.Count, SEED_TYPE_INTEGER, ct);
 
-        var metaRefs = new List<long> { trackId, widthAtom, heightAtom, fpsAtom, frameCountAtom };
+        var metaChildren = new List<(long id, bool isConstant)> {
+            (trackId, false),
+            (widthConstant, true),
+            (heightConstant, true),
+            (fpsConstant, true),
+            (frameCountConstant, true)
+        };
         var metaMults = new List<int> { 1, 1, 1, 1, 1 };
 
-        // Link audio if present
+        // Link audio if present (audio is a composition)
         if (video.AudioAtomId.HasValue)
         {
-            metaRefs.Add(video.AudioAtomId.Value);
+            metaChildren.Add((video.AudioAtomId.Value, false));
             metaMults.Add(1);
         }
 
         var videoId = await CreateCompositionAsync(
-            metaRefs.ToArray(),
+            metaChildren.ToArray(),
             metaMults.ToArray(),
             null,
             ct
         );
 
-        Logger?.LogInformation("Ingested video as atom {AtomId}", videoId);
+        Logger?.LogInformation("Ingested video as composition {CompositionId}", videoId);
         return videoId;
     }
 
@@ -117,7 +123,7 @@ public class VideoIngestionService : IngestionServiceBase, IIngestionService<Vid
         Dictionary<uint, long> pixelLookup,
         CancellationToken ct)
     {
-        var rowAtomIds = new long[height];
+        var rowCompositionIds = new long[height];
 
         for (int y = 0; y < height; y++)
         {
@@ -126,19 +132,20 @@ public class VideoIngestionService : IngestionServiceBase, IIngestionService<Vid
 
             var (refs, mults) = CompressRow(rowPixels);
             
-            // Map pixel values to atom IDs using dictionary (O(1) per pixel, NO DB)
-            var pixelAtomIds = new long[refs.Length];
+            // Map pixel values to constant IDs using dictionary (O(1) per pixel, NO DB)
+            var pixelConstantIds = new long[refs.Length];
             for (int i = 0; i < refs.Length; i++)
             {
-                pixelAtomIds[i] = pixelLookup[refs[i]];
+                pixelConstantIds[i] = pixelLookup[refs[i]];
             }
 
-            rowAtomIds[y] = await CreateCompositionAsync(pixelAtomIds, mults, null, ct);
+            rowCompositionIds[y] = await CreateCompositionFromConstantsAsync(pixelConstantIds, mults, null, ct);
         }
 
+        var rowChildren = rowCompositionIds.Select(id => (id, isConstant: false)).ToArray();
         return await CreateCompositionAsync(
-            rowAtomIds,
-            Enumerable.Repeat(1, rowAtomIds.Length).ToArray(),
+            rowChildren,
+            Enumerable.Repeat(1, rowCompositionIds.Length).ToArray(),
             null,
             ct
         );
@@ -146,66 +153,91 @@ public class VideoIngestionService : IngestionServiceBase, IIngestionService<Vid
 
     public async Task<VideoData> ReconstructAsync(long compositionId, CancellationToken ct = default)
     {
-        var video = await Context.Atoms.FindAsync(new object[] { compositionId }, ct);
-
-        if (video?.Refs == null || video.Refs.Length < 5)
-            throw new InvalidOperationException($"Invalid video atom {compositionId}");
-
-        var trackAtomId = video.Refs[0];
-        var metaAtoms = await Context.Atoms
-            .Where(a => video.Refs.Skip(1).Take(4).Contains(a.Id))
+        // Get video composition relations via Relation table
+        var videoRelations = await Context.Relations
+            .Where(r => r.CompositionId == compositionId)
+            .OrderBy(r => r.Position)
             .ToListAsync(ct);
 
-        var width = (int)(metaAtoms.First(a => a.Id == video.Refs[1]).SeedValue ?? 0);
-        var height = (int)(metaAtoms.First(a => a.Id == video.Refs[2]).SeedValue ?? 0);
-        var frameRate = (metaAtoms.First(a => a.Id == video.Refs[3]).SeedValue ?? 30000) / 1000.0;
-        var frameCount = (int)(metaAtoms.First(a => a.Id == video.Refs[4]).SeedValue ?? 0);
+        if (videoRelations.Count < 5)
+            throw new InvalidOperationException($"Invalid video composition {compositionId}");
 
-        long? audioAtomId = video.Refs.Length > 5 ? video.Refs[5] : null;
+        var trackCompositionId = videoRelations[0].ChildCompositionId!.Value;
+        var metaConstantIds = videoRelations.Skip(1).Take(4).Select(r => r.ChildConstantId!.Value).ToList();
+        var metaConstants = await Context.Constants
+            .Where(c => metaConstantIds.Contains(c.Id))
+            .ToListAsync(ct);
 
-        var trackAtom = await Context.Atoms.FindAsync(new object[] { trackAtomId }, ct);
+        var width = (int)metaConstants.First(c => c.Id == videoRelations[1].ChildConstantId!.Value).SeedValue;
+        var height = (int)metaConstants.First(c => c.Id == videoRelations[2].ChildConstantId!.Value).SeedValue;
+        var frameRate = metaConstants.First(c => c.Id == videoRelations[3].ChildConstantId!.Value).SeedValue / 1000.0;
+        var frameCount = (int)metaConstants.First(c => c.Id == videoRelations[4].ChildConstantId!.Value).SeedValue;
 
-        if (trackAtom?.Refs == null)
-            throw new InvalidOperationException("Invalid video track atom");
+        // Audio is a composition (not constant)
+        long? audioCompositionId = videoRelations.Count > 5 ? videoRelations[5].ChildCompositionId : null;
+
+        // Get frame relations for track composition
+        var frameRelations = await Context.Relations
+            .Where(r => r.CompositionId == trackCompositionId)
+            .OrderBy(r => r.Position)
+            .ToListAsync(ct);
+
+        if (frameRelations.Count == 0)
+            throw new InvalidOperationException("Invalid video track composition");
 
         var frames = new List<uint[]>();
 
-        foreach (var frameId in trackAtom.Refs)
+        foreach (var frameRelation in frameRelations)
         {
-            var frame = await ReconstructFrameAsync(frameId, width, height, ct);
+            var frameCompositionId = frameRelation.ChildCompositionId ?? throw new InvalidOperationException("Frame relation missing child composition");
+            var frame = await ReconstructFrameAsync(frameCompositionId, width, height, ct);
             frames.Add(frame);
         }
 
-        return new VideoData(width, height, frameRate, frames, audioAtomId);
+        return new VideoData(width, height, frameRate, frames, audioCompositionId);
     }
 
-    private async Task<uint[]> ReconstructFrameAsync(long frameId, int width, int height, CancellationToken ct)
+    private async Task<uint[]> ReconstructFrameAsync(long frameCompositionId, int width, int height, CancellationToken ct)
     {
-        var frameAtom = await Context.Atoms.FindAsync(new object[] { frameId }, ct);
+        // Get row relations for frame composition
+        var rowRelations = await Context.Relations
+            .Where(r => r.CompositionId == frameCompositionId)
+            .OrderBy(r => r.Position)
+            .ToListAsync(ct);
 
-        if (frameAtom?.Refs == null)
+        if (rowRelations.Count == 0)
             return new uint[width * height];
 
         var pixels = new uint[width * height];
-        var rowAtoms = await Context.Atoms
-            .Where(a => frameAtom.Refs.Contains(a.Id))
-            .ToDictionaryAsync(a => a.Id, ct);
 
-        for (int y = 0; y < frameAtom.Refs.Length && y < height; y++)
+        for (int y = 0; y < rowRelations.Count && y < height; y++)
         {
-            var rowAtom = rowAtoms[frameAtom.Refs[y]];
-            if (rowAtom.Refs == null) continue;
+            // Get pixel relations for row
+            var rowCompositionId = rowRelations[y].ChildCompositionId ?? throw new InvalidOperationException("Row relation missing child composition");
+            var pixelRelations = await Context.Relations
+                .Where(r => r.CompositionId == rowCompositionId)
+                .OrderBy(r => r.Position)
+                .ToListAsync(ct);
 
-            var pixelConstants = await Context.Atoms
-                .Where(a => rowAtom.Refs.Contains(a.Id) && a.IsConstant)
-                .ToDictionaryAsync(a => a.Id, ct);
+            if (pixelRelations.Count == 0) continue;
+
+            var pixelConstantIds = pixelRelations
+                .Where(r => r.ChildConstantId.HasValue)
+                .Select(r => r.ChildConstantId!.Value)
+                .Distinct()
+                .ToList();
+            var pixelConstants = await Context.Constants
+                .Where(c => pixelConstantIds.Contains(c.Id))
+                .ToDictionaryAsync(c => c.Id, ct);
 
             int x = 0;
-            for (int i = 0; i < rowAtom.Refs.Length && x < width; i++)
+            foreach (var pixelRelation in pixelRelations)
             {
-                var pixelAtom = pixelConstants[rowAtom.Refs[i]];
-                var mult = rowAtom.Multiplicities?[i] ?? 1;
-                var pixelValue = (uint)(pixelAtom.SeedValue ?? 0);
+                if (x >= width) break;
+
+                var pixelConstant = pixelConstants[pixelRelation.ChildConstantId!.Value];
+                var mult = pixelRelation.Multiplicity;
+                var pixelValue = (uint)pixelConstant.SeedValue;
 
                 for (int m = 0; m < mult && x < width; m++)
                 {
@@ -237,6 +269,27 @@ public class VideoIngestionService : IngestionServiceBase, IIngestionService<Vid
         }
 
         return (refs.ToArray(), mults.ToArray());
+    }
+
+    /// <summary>
+    /// Bulk get or create constants for an array of seed values.
+    /// Returns a dictionary mapping seed values to constant IDs.
+    /// </summary>
+    private async Task<Dictionary<uint, long>> BulkGetOrCreateConstantsAsync(
+        uint[] seedValues,
+        int seedType,
+        CancellationToken ct)
+    {
+        var result = new Dictionary<uint, long>();
+
+        foreach (var seedValue in seedValues)
+        {
+            ct.ThrowIfCancellationRequested();
+            var constantId = await GetOrCreateConstantAsync(seedValue, seedType, ct);
+            result[seedValue] = constantId;
+        }
+
+        return result;
     }
 }
 

@@ -1,6 +1,11 @@
 using Hart.MCP.Core.Services;
 using Microsoft.AspNetCore.Mvc;
 using Microsoft.AspNetCore.RateLimiting;
+using Microsoft.EntityFrameworkCore;
+
+// Re-export types from Core for API responses
+using CompositionStats = Hart.MCP.Core.Services.CompositionStats;
+using NodeCounts = Hart.MCP.Core.Services.NodeCounts;
 
 namespace Hart.MCP.Api.Controllers;
 
@@ -42,13 +47,13 @@ public class QueryController : ControllerBase
                 seed,
                 limit,
                 results.Count,
-                results.Select(a => new AtomSummary(
-                    a.Id,
-                    a.HilbertHigh,
-                    a.HilbertLow,
-                    a.IsConstant,
-                    a.AtomType,
-                    a.Geom.GeometryType
+                results.Select(c => new ConstantSummary(
+                    c.Id,
+                    c.HilbertHigh,
+                    c.HilbertLow,
+                    c.SeedValue,
+                    c.SeedType,
+                    c.Geom?.GeometryType ?? "None"
                 )).ToList()
             ));
         }
@@ -64,34 +69,34 @@ public class QueryController : ControllerBase
     }
 
     /// <summary>
-    /// Find atoms within Hilbert range
+    /// Find constants within Hilbert range
     /// </summary>
     [HttpGet("hilbert-range")]
     [ProducesResponseType(typeof(HilbertRangeResponse), StatusCodes.Status200OK)]
     [ProducesResponseType(typeof(ErrorResponse), StatusCodes.Status400BadRequest)]
     public async Task<IActionResult> FindInHilbertRange(
-        [FromQuery] long startHigh,
-        [FromQuery] long startLow,
-        [FromQuery] long endHigh,
-        [FromQuery] long endLow,
+        [FromQuery] ulong startHigh,
+        [FromQuery] ulong startLow,
+        [FromQuery] ulong endHigh,
+        [FromQuery] ulong endLow,
         [FromQuery] int limit = 100,
         CancellationToken cancellationToken = default)
     {
         try
         {
-            var results = await _queryService.FindInHilbertRangeAsync(
+            var results = await _queryService.FindConstantsInHilbertRangeAsync(
                 startHigh, startLow, endHigh, endLow, limit, cancellationToken);
 
             return Ok(new HilbertRangeResponse(
                 new HilbertRange(startHigh, startLow, endHigh, endLow),
                 results.Count,
-                results.Select(a => new AtomSummary(
-                    a.Id,
-                    a.HilbertHigh,
-                    a.HilbertLow,
-                    a.IsConstant,
-                    a.AtomType,
-                    a.Geom.GeometryType
+                results.Select(c => new ConstantSummary(
+                    c.Id,
+                    c.HilbertHigh,
+                    c.HilbertLow,
+                    c.SeedValue,
+                    c.SeedType,
+                    c.Geom?.GeometryType ?? "None"
                 )).ToList()
             ));
         }
@@ -107,26 +112,33 @@ public class QueryController : ControllerBase
     }
 
     /// <summary>
-    /// Find atoms that reference a specific atom (backlinks)
+    /// Find compositions that reference a specific composition (backlinks)
     /// </summary>
-    [HttpGet("backlinks/{atomId:long}")]
+    [HttpGet("backlinks/{compositionId:long}")]
     [ProducesResponseType(typeof(BacklinksResponse), StatusCodes.Status200OK)]
     [ProducesResponseType(typeof(ErrorResponse), StatusCodes.Status400BadRequest)]
     public async Task<IActionResult> FindBacklinks(
-        long atomId, 
+        long compositionId, 
         [FromQuery] int limit = 100,
         CancellationToken cancellationToken = default)
     {
         try
         {
-            var results = await _queryService.FindReferencingAtomsAsync(atomId, limit, cancellationToken);
+            var results = await _queryService.FindCompositionsReferencingCompositionAsync(compositionId, limit, cancellationToken);
+            // Get ref counts for each composition via Relations table
+            var refCounts = await _queryService.Context.Relations
+                .Where(r => results.Select(c => c.Id).Contains(r.CompositionId))
+                .GroupBy(r => r.CompositionId)
+                .Select(g => new { CompositionId = g.Key, Count = g.Count() })
+                .ToDictionaryAsync(x => x.CompositionId, x => x.Count, cancellationToken);
+
             return Ok(new BacklinksResponse(
-                atomId,
+                compositionId,
                 results.Count,
-                results.Select(a => new CompositionSummary(
-                    a.Id,
-                    a.Refs?.Length ?? 0,
-                    a.AtomType
+                results.Select(c => new CompositionSummary(
+                    c.Id,
+                    refCounts.GetValueOrDefault(c.Id, 0),
+                    c.TypeId?.ToString()
                 )).ToList()
             ));
         }
@@ -136,7 +148,7 @@ public class QueryController : ControllerBase
         }
         catch (Exception ex)
         {
-            _logger.LogError(ex, "Failed to find backlinks for atom {AtomId}", atomId);
+            _logger.LogError(ex, "Failed to find backlinks for composition {CompositionId}", compositionId);
             return StatusCode(500, new ErrorResponse("An error occurred while finding backlinks"));
         }
     }
@@ -156,13 +168,20 @@ public class QueryController : ControllerBase
         try
         {
             var results = await _queryService.FindSimilarCompositionsAsync(compositionId, limit, cancellationToken);
+            // Get ref counts for each composition via Relations table
+            var similarRefCounts = await _queryService.Context.Relations
+                .Where(r => results.Select(c => c.Id).Contains(r.CompositionId))
+                .GroupBy(r => r.CompositionId)
+                .Select(g => new { CompositionId = g.Key, Count = g.Count() })
+                .ToDictionaryAsync(x => x.CompositionId, x => x.Count, cancellationToken);
+
             return Ok(new SimilarResponse(
                 compositionId,
                 results.Count,
-                results.Select(a => new CompositionSummary(
-                    a.Id,
-                    a.Refs?.Length ?? 0,
-                    a.AtomType
+                results.Select(c => new CompositionSummary(
+                    c.Id,
+                    similarRefCounts.GetValueOrDefault(c.Id, 0),
+                    c.TypeId?.ToString()
                 )).ToList()
             ));
         }
@@ -251,48 +270,47 @@ public class QueryController : ControllerBase
     }
 
     /// <summary>
-    /// Get atom counts
+    /// Get node counts
     /// </summary>
     [HttpGet("counts")]
-    [ProducesResponseType(typeof(AtomCounts), StatusCodes.Status200OK)]
+    [ProducesResponseType(typeof(NodeCounts), StatusCodes.Status200OK)]
     public async Task<IActionResult> GetCounts(CancellationToken cancellationToken = default)
     {
         try
         {
-            var counts = await _queryService.GetAtomCountsAsync(cancellationToken);
+            var counts = await _queryService.GetNodeCountsAsync(cancellationToken);
             return Ok(counts);
         }
         catch (Exception ex)
         {
-            _logger.LogError(ex, "Failed to get atom counts");
-            return StatusCode(500, new ErrorResponse("An error occurred while getting atom counts"));
+            _logger.LogError(ex, "Failed to get node counts");
+            return StatusCode(500, new ErrorResponse("An error occurred while getting node counts"));
         }
     }
 
     /// <summary>
-    /// Search atoms by type
+    /// Search compositions by type ID
     /// </summary>
-    [HttpGet("by-type/{atomType}")]
+    [HttpGet("by-type/{typeId:long}")]
     [ProducesResponseType(typeof(TypeSearchResponse), StatusCodes.Status200OK)]
     [ProducesResponseType(typeof(ErrorResponse), StatusCodes.Status400BadRequest)]
     public async Task<IActionResult> FindByType(
-        string atomType,
+        long typeId,
         [FromQuery] int limit = 100,
         CancellationToken cancellationToken = default)
     {
         try
         {
-            var results = await _queryService.FindByTypeAsync(atomType, limit, cancellationToken);
+            var results = await _queryService.FindByTypeIdAsync(typeId, limit, cancellationToken);
             return Ok(new TypeSearchResponse(
-                atomType,
+                typeId.ToString(),
                 results.Count,
-                results.Select(a => new AtomSummary(
-                    a.Id,
-                    a.HilbertHigh,
-                    a.HilbertLow,
-                    a.IsConstant,
-                    a.AtomType,
-                    a.Geom.GeometryType
+                results.Select(c => new CompositionSummaryExtended(
+                    c.Id,
+                    c.HilbertHigh,
+                    c.HilbertLow,
+                    c.TypeId?.ToString(),
+                    c.Geom?.GeometryType ?? "None"
                 )).ToList()
             ));
         }
@@ -302,22 +320,23 @@ public class QueryController : ControllerBase
         }
         catch (Exception ex)
         {
-            _logger.LogError(ex, "Failed to search atoms by type {AtomType}", atomType);
+            _logger.LogError(ex, "Failed to search compositions by type {TypeId}", typeId);
             return StatusCode(500, new ErrorResponse("An error occurred while searching by type"));
         }
     }
 }
 
 // Response DTOs
-public record AtomSummary(long Id, long HilbertHigh, long HilbertLow, bool IsConstant, string? AtomType, string GeometryType);
-public record CompositionSummary(long Id, int RefCount, string? AtomType);
-public record HilbertRange(long StartHigh, long StartLow, long EndHigh, long EndLow);
+public record ConstantSummary(long Id, ulong HilbertHigh, ulong HilbertLow, long SeedValue, int SeedType, string GeometryType);
+public record CompositionSummary(long Id, int RefCount, string? TypeId);
+public record CompositionSummaryExtended(long Id, ulong HilbertHigh, ulong HilbertLow, string? TypeId, string GeometryType);
+public record HilbertRange(ulong StartHigh, ulong StartLow, ulong EndHigh, ulong EndLow);
 
-public record NeighborsResponse(uint Seed, int Limit, int Count, List<AtomSummary> Results);
-public record HilbertRangeResponse(HilbertRange Range, int Count, List<AtomSummary> Results);
-public record BacklinksResponse(long AtomId, int Count, List<CompositionSummary> Results);
+public record NeighborsResponse(uint Seed, int Limit, int Count, List<ConstantSummary> Results);
+public record HilbertRangeResponse(HilbertRange Range, int Count, List<ConstantSummary> Results);
+public record BacklinksResponse(long CompositionId, int Count, List<CompositionSummary> Results);
 public record SimilarResponse(long CompositionId, int Count, List<CompositionSummary> Results);
-public record TypeSearchResponse(string AtomType, int Count, List<AtomSummary> Results);
+public record TypeSearchResponse(string TypeId, int Count, List<CompositionSummaryExtended> Results);
 public record DiffResponse(
     long CompositionA, 
     long CompositionB, 

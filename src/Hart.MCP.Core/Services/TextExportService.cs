@@ -16,10 +16,15 @@ namespace Hart.MCP.Core.Services;
 /// 4. Stream output for large texts
 /// 
 /// The Merkle DAG structure means:
-/// - Root contains everything
+/// - Root Composition contains everything
 /// - Each level expands geometrically
 /// - Constants (chars) are at the leaves
 /// - Hilbert curves, projections = deterministic from SeedValue
+/// 
+/// Schema:
+/// - Constant: leaf nodes (Unicode codepoints) with SeedValue, SeedType
+/// - Composition: internal nodes with Relations to children
+/// - Relation: edges linking Composition to child Constants or Compositions
 /// </summary>
 public class TextExportService
 {
@@ -27,7 +32,8 @@ public class TextExportService
     private readonly ILogger<TextExportService>? _logger;
 
     // Cache for reconstructed patterns - content-addressed means immutable
-    private readonly Dictionary<long, string> _reconstructionCache = new();
+    // Key format: "C{id}" for Constant, "P{id}" for Composition
+    private readonly Dictionary<string, string> _reconstructionCache = new();
 
     public TextExportService(HartDbContext context, ILogger<TextExportService>? logger = null)
     {
@@ -36,11 +42,11 @@ public class TextExportService
     }
 
     /// <summary>
-    /// Export text from an atom using optimized BFS traversal.
+    /// Export text from a composition using optimized BFS traversal.
     /// Returns the reconstructed text and export statistics.
     /// </summary>
     public async Task<TextExportResult> ExportTextAsync(
-        long rootAtomId,
+        long rootCompositionId,
         CancellationToken cancellationToken = default)
     {
         var stopwatch = System.Diagnostics.Stopwatch.StartNew();
@@ -49,34 +55,22 @@ public class TextExportService
         // Clear cache for fresh export (or keep for repeated exports of similar content)
         _reconstructionCache.Clear();
 
-        // Load root atom
-        var rootAtom = await _context.Atoms.FindAsync(new object[] { rootAtomId }, cancellationToken);
-        if (rootAtom == null)
-            throw new ArgumentException($"Atom {rootAtomId} not found");
+        // Load root composition
+        var rootComposition = await _context.Compositions.FindAsync(new object[] { rootCompositionId }, cancellationToken);
+        if (rootComposition == null)
+            throw new ArgumentException($"Composition {rootCompositionId} not found");
 
-        stats.TotalAtoms++;
-
-        // Fast path: single character
-        if (rootAtom.IsConstant)
-        {
-            var charText = ReconstructConstant(rootAtom);
-            stopwatch.Stop();
-            return new TextExportResult
-            {
-                Text = charText,
-                Stats = stats with { ExportTimeMs = stopwatch.ElapsedMilliseconds }
-            };
-        }
+        stats.TotalNodes++;
 
         // BFS reconstruction with batch loading
-        var text = await ReconstructBFSAsync(rootAtom, stats, cancellationToken);
+        var text = await ReconstructBFSAsync(rootComposition, stats, cancellationToken);
 
         stopwatch.Stop();
         stats.ExportTimeMs = stopwatch.ElapsedMilliseconds;
 
         _logger?.LogInformation(
-            "Export complete: {Chars} chars, {Atoms} atoms, {CacheHits} cache hits, {Queries} queries, {Time}ms",
-            text.Length, stats.TotalAtoms, stats.CacheHits, stats.DbQueries, stats.ExportTimeMs);
+            "Export complete: {Chars} chars, {Nodes} nodes, {CacheHits} cache hits, {Queries} queries, {Time}ms",
+            text.Length, stats.TotalNodes, stats.CacheHits, stats.DbQueries, stats.ExportTimeMs);
 
         return new TextExportResult
         {
@@ -89,90 +83,129 @@ public class TextExportService
     /// BFS reconstruction with batch loading.
     /// 
     /// Strategy:
-    /// 1. Start with root's refs
-    /// 2. Batch-load all referenced atoms
+    /// 1. Start with root's relations
+    /// 2. Batch-load all referenced constants and compositions
     /// 3. For each: if constant → emit char; if composition → queue children
     /// 4. Use cache to skip already-reconstructed patterns
     /// </summary>
     private async Task<string> ReconstructBFSAsync(
-        Atom rootAtom,
+        Composition rootComposition,
         ExportStats stats,
         CancellationToken cancellationToken)
     {
-        if (rootAtom.Refs == null || rootAtom.Refs.Length == 0)
+        // Check if composition has any relations
+        var hasRelations = await _context.Relations.AnyAsync(r => r.CompositionId == rootComposition.Id, cancellationToken);
+        if (!hasRelations)
             return "";
 
         // We need to maintain order, so we'll use a different approach:
         // Recursively reconstruct but with BATCH loading at each level
-        var result = await ReconstructWithBatchLoadingAsync(rootAtom, stats, cancellationToken);
+        var result = await ReconstructCompositionAsync(rootComposition, stats, cancellationToken);
         return result;
     }
 
     /// <summary>
-    /// Reconstruct a composition atom with batch loading of children.
+    /// Reconstruct a composition with batch loading of children.
     /// Uses memoization cache for patterns.
     /// </summary>
-    private async Task<string> ReconstructWithBatchLoadingAsync(
-        Atom atom,
+    private async Task<string> ReconstructCompositionAsync(
+        Composition composition,
         ExportStats stats,
         CancellationToken cancellationToken)
     {
+        var cacheKey = $"P{composition.Id}";
+        
         // Check cache first
-        if (_reconstructionCache.TryGetValue(atom.Id, out var cached))
+        if (_reconstructionCache.TryGetValue(cacheKey, out var cached))
         {
             stats.CacheHits++;
             return cached;
         }
 
-        if (atom.IsConstant)
-        {
-            var text = ReconstructConstant(atom);
-            _reconstructionCache[atom.Id] = text;
-            return text;
-        }
+        // Get relations ordered by position
+        var relations = await _context.Relations
+            .Where(r => r.CompositionId == composition.Id)
+            .OrderBy(r => r.Position)
+            .ToListAsync(cancellationToken);
 
-        if (atom.Refs == null || atom.Refs.Length == 0)
+        stats.DbQueries++;
+
+        if (relations.Count == 0)
         {
-            _reconstructionCache[atom.Id] = "";
+            _reconstructionCache[cacheKey] = "";
             return "";
         }
 
-        // Batch load ALL children in one query
-        var childIds = atom.Refs.Distinct().ToList();
+        // Separate constant and composition children
+        var constantIds = relations
+            .Where(r => r.ChildConstantId.HasValue)
+            .Select(r => r.ChildConstantId!.Value)
+            .Distinct()
+            .ToList();
         
-        // Check which ones we already have cached
-        var uncachedIds = childIds.Where(id => !_reconstructionCache.ContainsKey(id)).ToList();
+        var compositionIds = relations
+            .Where(r => r.ChildCompositionId.HasValue)
+            .Select(r => r.ChildCompositionId!.Value)
+            .Distinct()
+            .ToList();
 
-        if (uncachedIds.Count > 0)
+        // Batch load constants that aren't cached
+        var uncachedConstantIds = constantIds.Where(id => !_reconstructionCache.ContainsKey($"C{id}")).ToList();
+        if (uncachedConstantIds.Count > 0)
         {
             stats.DbQueries++;
-            var children = await _context.Atoms
-                .Where(a => uncachedIds.Contains(a.Id))
-                .ToDictionaryAsync(a => a.Id, cancellationToken);
+            var constants = await _context.Constants
+                .Where(c => uncachedConstantIds.Contains(c.Id))
+                .ToListAsync(cancellationToken);
 
-            stats.TotalAtoms += children.Count;
+            stats.TotalNodes += constants.Count;
 
-            // Reconstruct each uncached child (recursively with batch loading)
-            foreach (var child in children.Values)
+            foreach (var constant in constants)
             {
-                if (!_reconstructionCache.ContainsKey(child.Id))
+                _reconstructionCache[$"C{constant.Id}"] = ReconstructConstant(constant);
+            }
+        }
+
+        // Batch load compositions that aren't cached
+        var uncachedCompositionIds = compositionIds.Where(id => !_reconstructionCache.ContainsKey($"P{id}")).ToList();
+        if (uncachedCompositionIds.Count > 0)
+        {
+            stats.DbQueries++;
+            var childCompositions = await _context.Compositions
+                .Where(c => uncachedCompositionIds.Contains(c.Id))
+                .ToListAsync(cancellationToken);
+
+            stats.TotalNodes += childCompositions.Count;
+
+            // Recursively reconstruct each uncached child composition
+            foreach (var childComp in childCompositions)
+            {
+                if (!_reconstructionCache.ContainsKey($"P{childComp.Id}"))
                 {
-                    var childText = await ReconstructWithBatchLoadingAsync(child, stats, cancellationToken);
-                    _reconstructionCache[child.Id] = childText;
+                    var childText = await ReconstructCompositionAsync(childComp, stats, cancellationToken);
+                    _reconstructionCache[$"P{childComp.Id}"] = childText;
                 }
             }
         }
 
         // Now build the result from cached values
         var sb = new StringBuilder();
-        for (int i = 0; i < atom.Refs.Length; i++)
+        foreach (var relation in relations)
         {
-            var refId = atom.Refs[i];
-            var multiplicity = atom.Multiplicities?[i] ?? 1;
-
-            if (_reconstructionCache.TryGetValue(refId, out var childText))
+            string? childText = null;
+            
+            if (relation.ChildConstantId.HasValue)
             {
-                for (int m = 0; m < multiplicity; m++)
+                _reconstructionCache.TryGetValue($"C{relation.ChildConstantId.Value}", out childText);
+            }
+            else if (relation.ChildCompositionId.HasValue)
+            {
+                _reconstructionCache.TryGetValue($"P{relation.ChildCompositionId.Value}", out childText);
+            }
+
+            if (childText != null)
+            {
+                for (int m = 0; m < relation.Multiplicity; m++)
                 {
                     sb.Append(childText);
                 }
@@ -180,20 +213,20 @@ public class TextExportService
         }
 
         var result = sb.ToString();
-        _reconstructionCache[atom.Id] = result;
+        _reconstructionCache[cacheKey] = result;
         return result;
     }
 
     /// <summary>
-    /// Reconstruct a constant atom to its character.
+    /// Reconstruct a constant to its character.
     /// SeedValue → Unicode codepoint → string
     /// No geometry needed - it's deterministic from the seed.
     /// </summary>
-    private static string ReconstructConstant(Atom atom)
+    private static string ReconstructConstant(Constant constant)
     {
-        if (atom.SeedType == 0 && atom.SeedValue.HasValue) // Unicode
+        if (constant.SeedType == 0) // Unicode
         {
-            return char.ConvertFromUtf32((int)atom.SeedValue.Value);
+            return char.ConvertFromUtf32((int)constant.SeedValue);
         }
         return "";
     }
@@ -203,52 +236,82 @@ public class TextExportService
     /// Yields chunks as they're reconstructed.
     /// </summary>
     public async IAsyncEnumerable<string> ExportTextStreamAsync(
-        long rootAtomId,
+        long rootCompositionId,
         [System.Runtime.CompilerServices.EnumeratorCancellation] CancellationToken cancellationToken = default)
     {
-        var rootAtom = await _context.Atoms.FindAsync(new object[] { rootAtomId }, cancellationToken);
-        if (rootAtom == null)
-            throw new ArgumentException($"Atom {rootAtomId} not found");
+        var rootComposition = await _context.Compositions.FindAsync(new object[] { rootCompositionId }, cancellationToken);
+        if (rootComposition == null)
+            throw new ArgumentException($"Composition {rootCompositionId} not found");
 
-        if (rootAtom.IsConstant)
-        {
-            yield return ReconstructConstant(rootAtom);
+        // Get relations ordered by position
+        var relations = await _context.Relations
+            .Where(r => r.CompositionId == rootCompositionId)
+            .OrderBy(r => r.Position)
+            .ToListAsync(cancellationToken);
+
+        if (relations.Count == 0)
             yield break;
-        }
 
-        if (rootAtom.Refs == null || rootAtom.Refs.Length == 0)
-            yield break;
+        // Batch load all child constants
+        var constantIds = relations
+            .Where(r => r.ChildConstantId.HasValue)
+            .Select(r => r.ChildConstantId!.Value)
+            .Distinct()
+            .ToList();
+        
+        var constants = await _context.Constants
+            .Where(c => constantIds.Contains(c.Id))
+            .ToDictionaryAsync(c => c.Id, cancellationToken);
 
-        // Stream each top-level reference
-        var childIds = rootAtom.Refs.Distinct().ToList();
-        var children = await _context.Atoms
-            .Where(a => childIds.Contains(a.Id))
-            .ToDictionaryAsync(a => a.Id, cancellationToken);
+        // Batch load all child compositions
+        var compositionIds = relations
+            .Where(r => r.ChildCompositionId.HasValue)
+            .Select(r => r.ChildCompositionId!.Value)
+            .Distinct()
+            .ToList();
+        
+        var childCompositions = await _context.Compositions
+            .Where(c => compositionIds.Contains(c.Id))
+            .ToDictionaryAsync(c => c.Id, cancellationToken);
 
         var stats = new ExportStats();
         
-        for (int i = 0; i < rootAtom.Refs.Length; i++)
+        foreach (var relation in relations)
         {
             cancellationToken.ThrowIfCancellationRequested();
 
-            var refId = rootAtom.Refs[i];
-            var multiplicity = rootAtom.Multiplicities?[i] ?? 1;
+            string? childText = null;
 
-            if (children.TryGetValue(refId, out var child))
+            if (relation.ChildConstantId.HasValue && constants.TryGetValue(relation.ChildConstantId.Value, out var constant))
             {
-                // Check cache or reconstruct
-                string childText;
-                if (_reconstructionCache.TryGetValue(refId, out var cached))
+                var cacheKey = $"C{constant.Id}";
+                if (_reconstructionCache.TryGetValue(cacheKey, out var cached))
                 {
                     childText = cached;
                 }
                 else
                 {
-                    childText = await ReconstructWithBatchLoadingAsync(child, stats, cancellationToken);
-                    _reconstructionCache[refId] = childText;
+                    childText = ReconstructConstant(constant);
+                    _reconstructionCache[cacheKey] = childText;
                 }
+            }
+            else if (relation.ChildCompositionId.HasValue && childCompositions.TryGetValue(relation.ChildCompositionId.Value, out var childComp))
+            {
+                var cacheKey = $"P{childComp.Id}";
+                if (_reconstructionCache.TryGetValue(cacheKey, out var cached))
+                {
+                    childText = cached;
+                }
+                else
+                {
+                    childText = await ReconstructCompositionAsync(childComp, stats, cancellationToken);
+                    _reconstructionCache[cacheKey] = childText;
+                }
+            }
 
-                for (int m = 0; m < multiplicity; m++)
+            if (childText != null)
+            {
+                for (int m = 0; m < relation.Multiplicity; m++)
                 {
                     yield return childText;
                 }
@@ -333,13 +396,13 @@ public record TextExportResult
 /// </summary>
 public record ExportStats
 {
-    public int TotalAtoms { get; set; }
+    public int TotalNodes { get; set; }
     public int CacheHits { get; set; }
     public int DbQueries { get; set; }
     public int ChunksWritten { get; set; }
     public long ExportTimeMs { get; set; }
     
-    public double CacheHitRate => TotalAtoms > 0 ? (double)CacheHits / TotalAtoms : 0;
+    public double CacheHitRate => TotalNodes > 0 ? (double)CacheHits / TotalNodes : 0;
 }
 
 /// <summary>

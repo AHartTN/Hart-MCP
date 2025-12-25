@@ -108,7 +108,7 @@ builder.Services.AddScoped<SpatialQueryService>();
 builder.Services.AddScoped<AIQueryService>();
 
 // High-performance parallel services (use IDbContextFactory for thread safety)
-builder.Services.AddSingleton<Hart.MCP.Core.Services.Optimized.ParallelAtomIngestionService>();
+builder.Services.AddSingleton<Hart.MCP.Core.Services.Optimized.ParallelIngestionService>();
 builder.Services.AddSingleton<Hart.MCP.Core.Services.Optimized.ParallelSpatialQueryService>();
 
 // CORS configuration

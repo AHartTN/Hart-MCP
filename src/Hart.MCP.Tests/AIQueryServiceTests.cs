@@ -48,46 +48,54 @@ public class AIQueryServiceTests : IDisposable
     #region Test Data Helpers
 
     /// <summary>
-    /// Creates test atoms at specific positions for predictable spatial relationships:
-    /// - Atom 1 (A): at origin (0.1, 0.1, 0.1, 0.1)
-    /// - Atom 2 (B): very close to A (0.12, 0.12, 0.12, 0.12)
-    /// - Atom 3 (C): close to A (0.15, 0.15, 0.15, 0.15)
-    /// - Atom 4 (D): far from A (0.9, 0.9, 0.9, 0.9)
-    /// - Atom 5 (E): middle (0.5, 0.5, 0.5, 0.5)
+    /// Creates test constants at specific positions for predictable spatial relationships:
+    /// - Constant 1 (A): at origin (0.1, 0.1, 0.1, 0.1)
+    /// - Constant 2 (B): very close to A (0.12, 0.12, 0.12, 0.12)
+    /// - Constant 3 (C): close to A (0.15, 0.15, 0.15, 0.15)
+    /// - Constant 4 (D): far from A (0.9, 0.9, 0.9, 0.9)
+    /// - Constant 5 (E): middle (0.5, 0.5, 0.5, 0.5)
     /// </summary>
-    private async Task<List<Atom>> SeedTestAtomsWithPredictableSpatialRelationshipsAsync()
+    private async Task<List<Constant>> SeedTestConstantsWithPredictableSpatialRelationshipsAsync()
     {
-        var atoms = new List<Atom>
+        var constants = new List<Constant>
         {
-            CreateAtom(1, 0.1, 0.1, 0.1, 0.1, isConstant: true, atomType: "char", seedValue: 65),  // A
-            CreateAtom(2, 0.12, 0.12, 0.12, 0.12, isConstant: true, atomType: "char", seedValue: 66),  // B - closest to A
-            CreateAtom(3, 0.15, 0.15, 0.15, 0.15, isConstant: true, atomType: "char", seedValue: 67),  // C - second closest to A
-            CreateAtom(4, 0.9, 0.9, 0.9, 0.9, isConstant: true, atomType: "char", seedValue: 68),  // D - far from A
-            CreateAtom(5, 0.5, 0.5, 0.5, 0.5, isConstant: true, atomType: "char", seedValue: 69),  // E - middle
+            CreateConstant(1, 0.1, 0.1, 0.1, 0.1, seedValue: 65),  // A
+            CreateConstant(2, 0.12, 0.12, 0.12, 0.12, seedValue: 66),  // B - closest to A
+            CreateConstant(3, 0.15, 0.15, 0.15, 0.15, seedValue: 67),  // C - second closest to A
+            CreateConstant(4, 0.9, 0.9, 0.9, 0.9, seedValue: 68),  // D - far from A
+            CreateConstant(5, 0.5, 0.5, 0.5, 0.5, seedValue: 69),  // E - middle
         };
 
-        _context.Atoms.AddRange(atoms);
+        _context.Constants.AddRange(constants);
         await _context.SaveChangesAsync();
-        return atoms;
+        return constants;
     }
 
-    private Atom CreateAtom(long id, double x, double y, double z, double m,
-        bool isConstant, string atomType, uint? seedValue = null, 
-        long[]? refs = null, int[]? multiplicities = null)
+    private Constant CreateConstant(long id, double x, double y, double z, double m, long seedValue = 0, int seedType = 1)
     {
         var geom = _geometryFactory.CreatePoint(new CoordinateZM(x, y, z, m));
-        return new Atom
+        return new Constant
         {
             Id = id,
-            HilbertHigh = (long)(x * 10000),
-            HilbertLow = (long)(y * 10000),
+            HilbertHigh = (ulong)(x * 10000),
+            HilbertLow = (ulong)(y * 10000),
             Geom = geom,
-            IsConstant = isConstant,
-            AtomType = atomType,
             SeedValue = seedValue,
-            SeedType = isConstant ? 0 : null,
-            Refs = isConstant ? null : refs,
-            Multiplicities = isConstant ? null : multiplicities,
+            SeedType = seedType,
+            ContentHash = BitConverter.GetBytes(id)
+        };
+    }
+
+    private Composition CreateComposition(long id, double x, double y, double z, double m, long? typeId = null)
+    {
+        var geom = _geometryFactory.CreatePoint(new CoordinateZM(x, y, z, m));
+        return new Composition
+        {
+            Id = id,
+            HilbertHigh = (ulong)(x * 10000),
+            HilbertLow = (ulong)(y * 10000),
+            Geom = geom,
+            TypeId = typeId,
             ContentHash = BitConverter.GetBytes(id)
         };
     }
@@ -109,8 +117,8 @@ public class AIQueryServiceTests : IDisposable
     [Fact]
     public async Task ComputeAttention_GivenQueryAndKeys_ReturnsNormalizedWeightsSummingToOne()
     {
-        // Given: atoms at known positions
-        await SeedTestAtomsWithPredictableSpatialRelationshipsAsync();
+        // Given: constants at known positions
+        await SeedTestConstantsWithPredictableSpatialRelationshipsAsync();
         var queryId = 1L;
         var keyIds = new long[] { 2, 3, 4, 5 };
 
@@ -124,27 +132,27 @@ public class AIQueryServiceTests : IDisposable
     }
 
     [Fact]
-    public async Task ComputeAttention_GivenQueryAndKeys_CloserAtomGetsHigherWeight()
+    public async Task ComputeAttention_GivenQueryAndKeys_CloserConstantGetsHigherWeight()
     {
-        // Given: atoms where Atom2 is closest to Atom1, Atom4 is farthest
-        await SeedTestAtomsWithPredictableSpatialRelationshipsAsync();
+        // Given: constants where Constant2 is closest to Constant1, Constant4 is farthest
+        await SeedTestConstantsWithPredictableSpatialRelationshipsAsync();
         
-        // When: computing attention from Atom1 to all others
+        // When: computing attention from Constant1 to all others
         var results = await _service.ComputeAttentionAsync(1, new long[] { 2, 3, 4, 5 });
 
-        // Then: Atom2 should have HIGHEST weight (closest)
-        var atom2Result = results.First(r => r.KeyAtomId == 2);
-        var atom4Result = results.First(r => r.KeyAtomId == 4);
+        // Then: Constant2 should have HIGHEST weight (closest)
+        var constant2Result = results.First(r => r.KeyNodeId == 2);
+        var constant4Result = results.First(r => r.KeyNodeId == 4);
         
-        atom2Result.NormalizedWeight.Should().BeGreaterThan(atom4Result.NormalizedWeight,
-            "Closer atoms MUST receive higher attention weight (inverse distance relationship)");
+        constant2Result.NormalizedWeight.Should().BeGreaterThan(constant4Result.NormalizedWeight,
+            "Closer constants MUST receive higher attention weight (inverse distance relationship)");
     }
 
     [Fact]
     public async Task ComputeAttention_ResultsAreSortedByWeightDescending()
     {
-        // Given: atoms at known positions
-        await SeedTestAtomsWithPredictableSpatialRelationshipsAsync();
+        // Given: constants at known positions
+        await SeedTestConstantsWithPredictableSpatialRelationshipsAsync();
 
         // When: computing attention
         var results = await _service.ComputeAttentionAsync(1, new long[] { 2, 3, 4, 5 });
@@ -160,10 +168,10 @@ public class AIQueryServiceTests : IDisposable
     [Fact]
     public async Task ComputeAttention_NonExistentQuery_ThrowsInvalidOperationException()
     {
-        // Given: seeded atoms without ID 999
-        await SeedTestAtomsWithPredictableSpatialRelationshipsAsync();
+        // Given: seeded constants without ID 999
+        await SeedTestConstantsWithPredictableSpatialRelationshipsAsync();
 
-        // When/Then: querying non-existent atom should throw
+        // When/Then: querying non-existent constant should throw
         var action = () => _service.ComputeAttentionAsync(999, new long[] { 1, 2 });
         await action.Should().ThrowAsync<InvalidOperationException>()
             .WithMessage("*Query atom 999 not found*");
@@ -172,8 +180,8 @@ public class AIQueryServiceTests : IDisposable
     [Fact]
     public async Task ComputeMultiHeadAttention_ReturnsRequestedNumberOfHeads()
     {
-        // Given: test atoms and requested head count
-        await SeedTestAtomsWithPredictableSpatialRelationshipsAsync();
+        // Given: test constants and requested head count
+        await SeedTestConstantsWithPredictableSpatialRelationshipsAsync();
         const int requestedHeads = 4;
 
         // When: computing multi-head attention
@@ -188,8 +196,8 @@ public class AIQueryServiceTests : IDisposable
     [Fact]
     public async Task ComputeMultiHeadAttention_EachHeadNormalizesToOne()
     {
-        // Given: test atoms
-        await SeedTestAtomsWithPredictableSpatialRelationshipsAsync();
+        // Given: test constants
+        await SeedTestConstantsWithPredictableSpatialRelationshipsAsync();
 
         // When: computing multi-head attention
         var result = await _service.ComputeMultiHeadAttentionAsync(1, new long[] { 2, 3, 4, 5 }, 4);
@@ -206,8 +214,8 @@ public class AIQueryServiceTests : IDisposable
     [Fact]
     public async Task ComputeMultiHeadAttention_AggregatedNormalizesToOne()
     {
-        // Given: test atoms
-        await SeedTestAtomsWithPredictableSpatialRelationshipsAsync();
+        // Given: test constants
+        await SeedTestConstantsWithPredictableSpatialRelationshipsAsync();
 
         // When: computing multi-head attention
         var result = await _service.ComputeMultiHeadAttentionAsync(1, new long[] { 2, 3, 4, 5 }, 4);
@@ -223,53 +231,53 @@ public class AIQueryServiceTests : IDisposable
     #region Inference Tests
 
     [Fact]
-    public async Task InferRelatedConcepts_ReturnsOnlyAtomsWithinRadius()
+    public async Task InferRelatedConstants_ReturnsOnlyConstantsWithinRadius()
     {
-        // Given: atoms at known positions with specific distances from Atom1
-        await SeedTestAtomsWithPredictableSpatialRelationshipsAsync();
+        // Given: constants at known positions with specific distances from Constant1
+        await SeedTestConstantsWithPredictableSpatialRelationshipsAsync();
         
-        // Distance from Atom1 (0.1,0.1,0.1,0.1) to:
-        // Atom2: 0.04 (approx)
-        // Atom3: 0.1  (approx)
-        // Atom4: 1.6  (approx)
-        // Atom5: 0.8  (approx)
+        // Distance from Constant1 (0.1,0.1,0.1,0.1) to:
+        // Constant2: 0.04 (approx)
+        // Constant3: 0.1  (approx)
+        // Constant4: 1.6  (approx)
+        // Constant5: 0.8  (approx)
 
-        // When: querying with radius 0.2 (should include Atom2 and Atom3 only)
-        var results = await _service.InferRelatedConceptsAsync(1, radius: 0.2, limit: 10);
+        // When: querying with radius 0.2 (should include Constant2 and Constant3 only)
+        var results = await _service.InferRelatedConstantsAsync(1, radius: 0.2, limit: 10);
 
-        // Then: should find nearby atoms, not distant ones
-        var foundIds = results.Select(r => r.AtomId).ToList();
-        foundIds.Should().Contain(2, "Atom2 (distance ~0.04) MUST be found within radius 0.2");
-        foundIds.Should().Contain(3, "Atom3 (distance ~0.1) MUST be found within radius 0.2");
-        foundIds.Should().NotContain(4, "Atom4 (distance ~1.6) MUST NOT be found within radius 0.2");
+        // Then: should find nearby constants, not distant ones
+        var foundIds = results.Select(r => r.NodeId).ToList();
+        foundIds.Should().Contain(2, "Constant2 (distance ~0.04) MUST be found within radius 0.2");
+        foundIds.Should().Contain(3, "Constant3 (distance ~0.1) MUST be found within radius 0.2");
+        foundIds.Should().NotContain(4, "Constant4 (distance ~1.6) MUST NOT be found within radius 0.2");
     }
 
     [Fact]
-    public async Task InferRelatedConcepts_ConfidenceIsInverseOfDistance()
+    public async Task InferRelatedConstants_ConfidenceIsInverseOfDistance()
     {
-        // Given: atoms at known positions
-        await SeedTestAtomsWithPredictableSpatialRelationshipsAsync();
+        // Given: constants at known positions
+        await SeedTestConstantsWithPredictableSpatialRelationshipsAsync();
 
         // When: querying with large radius
-        var results = await _service.InferRelatedConceptsAsync(1, radius: 2.0, limit: 10);
+        var results = await _service.InferRelatedConstantsAsync(1, radius: 2.0, limit: 10);
 
-        // Then: closer atoms should have higher confidence
-        var atom2 = results.First(r => r.AtomId == 2);
-        var atom4 = results.First(r => r.AtomId == 4);
+        // Then: closer constants should have higher confidence
+        var constant2 = results.First(r => r.NodeId == 2);
+        var constant4 = results.First(r => r.NodeId == 4);
         
-        atom2.Confidence.Should().BeGreaterThan(atom4.Confidence,
-            "Closer atoms MUST have higher inference confidence");
+        constant2.Confidence.Should().BeGreaterThan(constant4.Confidence,
+            "Closer constants MUST have higher inference confidence");
     }
 
     [Fact]
-    public async Task InferRelatedConcepts_SmallRadiusReturnsFewerResults()
+    public async Task InferRelatedConstants_SmallRadiusReturnsFewerResults()
     {
-        // Given: atoms at various distances
-        await SeedTestAtomsWithPredictableSpatialRelationshipsAsync();
+        // Given: constants at various distances
+        await SeedTestConstantsWithPredictableSpatialRelationshipsAsync();
 
         // When: querying with different radii
-        var smallRadiusResults = await _service.InferRelatedConceptsAsync(1, radius: 0.05, limit: 10);
-        var largeRadiusResults = await _service.InferRelatedConceptsAsync(1, radius: 2.0, limit: 10);
+        var smallRadiusResults = await _service.InferRelatedConstantsAsync(1, radius: 0.05, limit: 10);
+        var largeRadiusResults = await _service.InferRelatedConstantsAsync(1, radius: 2.0, limit: 10);
 
         // Then: smaller radius should return fewer or equal results
         smallRadiusResults.Count.Should().BeLessThanOrEqualTo(largeRadiusResults.Count,
@@ -277,38 +285,64 @@ public class AIQueryServiceTests : IDisposable
     }
 
     [Fact]
-    public async Task InferChain_TraversesRefsToSpecifiedDepth()
+    public async Task InferChain_TraversesRelationsToSpecifiedDepth()
     {
         // Given: a chain of compositions: A -> B -> C
-        var atomA = CreateAtom(10, 0.1, 0.1, 0.1, 0.1, false, "composition", refs: new[] { 11L }, multiplicities: new[] { 1 });
-        var atomB = CreateAtom(11, 0.2, 0.2, 0.2, 0.2, false, "composition", refs: new[] { 12L }, multiplicities: new[] { 1 });
-        var atomC = CreateAtom(12, 0.3, 0.3, 0.3, 0.3, true, "constant", seedValue: 65);
+        var compA = CreateComposition(10, 0.1, 0.1, 0.1, 0.1);
+        var compB = CreateComposition(11, 0.2, 0.2, 0.2, 0.2);
+        var constC = CreateConstant(12, 0.3, 0.3, 0.3, 0.3, seedValue: 65);
         
-        _context.Atoms.AddRange(atomA, atomB, atomC);
+        _context.Compositions.AddRange(compA, compB);
+        _context.Constants.Add(constC);
+        
+        // Add Relation edges: A -> B -> C
+        _context.Relations.AddRange(
+            new Relation { CompositionId = 10, ChildCompositionId = 11, Position = 0, Multiplicity = 1 },
+            new Relation { CompositionId = 11, ChildConstantId = 12, Position = 0, Multiplicity = 1 }
+        );
         await _context.SaveChangesAsync();
 
         // When: traversing chain from A with depth 3
         var chain = await _service.InferChainAsync(10, maxDepth: 3);
 
-        // Then: should find all three atoms
-        chain.Nodes.Should().HaveCount(3, "Chain traversal MUST find all connected atoms within depth");
-        chain.Nodes.Select(n => n.AtomId).Should().Contain(new long[] { 10, 11, 12 });
+        // Then: should find all three nodes
+        chain.Nodes.Should().HaveCount(3, "Chain traversal MUST find all connected nodes within depth");
+        chain.Nodes.Select(n => n.NodeId).Should().Contain(new long[] { 10, 11, 12 });
     }
 
     [Fact]
     public async Task InferChain_RespectsMaxDepthLimit()
     {
         // Given: a chain of 5 compositions
-        var atoms = new List<Atom>();
-        for (int i = 0; i < 5; i++)
+        var compositions = new List<Composition>();
+        for (int i = 0; i < 4; i++)
         {
-            var refs = i < 4 ? new[] { (long)(100 + i + 1) } : null;
-            var mults = refs != null ? new[] { 1 } : null;
-            atoms.Add(CreateAtom(100 + i, i * 0.1, i * 0.1, i * 0.1, i * 0.1, 
-                i == 4, i == 4 ? "constant" : "composition", 
-                refs: refs, multiplicities: mults, seedValue: i == 4 ? 65u : null));
+            compositions.Add(CreateComposition(100 + i, i * 0.1, i * 0.1, i * 0.1, i * 0.1));
         }
-        _context.Atoms.AddRange(atoms);
+        var lastConstant = CreateConstant(104, 4 * 0.1, 4 * 0.1, 4 * 0.1, 4 * 0.1, seedValue: 65);
+        
+        _context.Compositions.AddRange(compositions);
+        _context.Constants.Add(lastConstant);
+        
+        // Create Relation chain: 100 -> 101 -> 102 -> 103 -> 104
+        for (int i = 0; i < 3; i++)
+        {
+            _context.Relations.Add(new Relation 
+            { 
+                CompositionId = 100 + i, 
+                ChildCompositionId = 100 + i + 1, 
+                Position = 0, 
+                Multiplicity = 1 
+            });
+        }
+        // Last relation points to a constant
+        _context.Relations.Add(new Relation
+        {
+            CompositionId = 103,
+            ChildConstantId = 104,
+            Position = 0,
+            Multiplicity = 1
+        });
         await _context.SaveChangesAsync();
 
         // When: traversing with depth limit of 2
@@ -323,15 +357,15 @@ public class AIQueryServiceTests : IDisposable
     #region Transformation Tests
 
     [Fact]
-    public async Task Transform_ToCoordinates_ReturnsCorrect4DVector()
+    public async Task TransformConstant_ToCoordinates_ReturnsCorrect4DVector()
     {
-        // Given: an atom at known position
-        var atom = CreateAtom(20, 1.5, 2.5, 3.5, 4.5, true, "constant", 65);
-        _context.Atoms.Add(atom);
+        // Given: a constant at known position
+        var constant = CreateConstant(20, 1.5, 2.5, 3.5, 4.5, seedValue: 65);
+        _context.Constants.Add(constant);
         await _context.SaveChangesAsync();
 
         // When: transforming to coordinates
-        var result = await _service.TransformAsync(20, "coordinates");
+        var result = await _service.TransformConstantAsync(20, "coordinates");
 
         // Then: should return correct coordinate values
         result.TargetRepresentation.Should().Be("coordinates");
@@ -349,15 +383,15 @@ public class AIQueryServiceTests : IDisposable
     }
 
     [Fact]
-    public async Task Transform_ToHilbert_ReturnsBothComponents()
+    public async Task TransformConstant_ToHilbert_ReturnsBothComponents()
     {
-        // Given: an atom with known Hilbert values
-        var atom = CreateAtom(21, 0.5, 0.5, 0.5, 0.5, true, "constant", 65);
-        _context.Atoms.Add(atom);
+        // Given: a constant with known Hilbert values
+        var constant = CreateConstant(21, 0.5, 0.5, 0.5, 0.5, seedValue: 65);
+        _context.Constants.Add(constant);
         await _context.SaveChangesAsync();
 
         // When: transforming to Hilbert
-        var result = await _service.TransformAsync(21, "hilbert");
+        var result = await _service.TransformConstantAsync(21, "hilbert");
 
         // Then: should return high and low components
         result.TargetRepresentation.Should().Be("hilbert");
@@ -368,15 +402,15 @@ public class AIQueryServiceTests : IDisposable
     }
 
     [Fact]
-    public async Task Transform_ToEmbedding_ReturnsFloatArray()
+    public async Task TransformConstant_ToEmbedding_ReturnsFloatArray()
     {
-        // Given: a constant atom
-        var atom = CreateAtom(22, 0.25, 0.5, 0.75, 1.0, true, "constant", 65);
-        _context.Atoms.Add(atom);
+        // Given: a constant
+        var constant = CreateConstant(22, 0.25, 0.5, 0.75, 1.0, seedValue: 65);
+        _context.Constants.Add(constant);
         await _context.SaveChangesAsync();
 
         // When: transforming to embedding
-        var result = await _service.TransformAsync(22, "embedding");
+        var result = await _service.TransformConstantAsync(22, "embedding");
 
         // Then: should return 4D float array
         result.TargetRepresentation.Should().Be("embedding");
@@ -391,15 +425,15 @@ public class AIQueryServiceTests : IDisposable
     }
 
     [Fact]
-    public async Task Transform_UnknownRepresentation_ThrowsArgumentException()
+    public async Task TransformConstant_UnknownRepresentation_ThrowsArgumentException()
     {
-        // Given: a valid atom
-        var atom = CreateAtom(23, 0.5, 0.5, 0.5, 0.5, true, "constant", 65);
-        _context.Atoms.Add(atom);
+        // Given: a valid constant
+        var constant = CreateConstant(23, 0.5, 0.5, 0.5, 0.5, seedValue: 65);
+        _context.Constants.Add(constant);
         await _context.SaveChangesAsync();
 
         // When/Then: transforming to unknown type should throw
-        var action = () => _service.TransformAsync(23, "invalid_representation");
+        var action = async () => await _service.TransformConstantAsync(23, "invalid_representation");
         await action.Should().ThrowAsync<ArgumentException>()
             .WithMessage("*Unknown target representation*");
     }
@@ -409,13 +443,13 @@ public class AIQueryServiceTests : IDisposable
     #region Generation Tests
 
     [Fact]
-    public async Task GenerateNext_ReturnsAtomsSortedByProbability()
+    public async Task GenerateNextConstant_ReturnsConstantsSortedByProbability()
     {
-        // Given: test atoms
-        await SeedTestAtomsWithPredictableSpatialRelationshipsAsync();
+        // Given: test constants
+        await SeedTestConstantsWithPredictableSpatialRelationshipsAsync();
 
         // When: generating next from context [1,2]
-        var results = await _service.GenerateNextAsync(new long[] { 1, 2 }, numCandidates: 3);
+        var results = await _service.GenerateNextConstantAsync(new long[] { 1, 2 }, numCandidates: 3);
 
         // Then: results should be sorted by probability descending
         for (int i = 0; i < results.Count - 1; i++)
@@ -426,13 +460,13 @@ public class AIQueryServiceTests : IDisposable
     }
 
     [Fact]
-    public async Task GenerateNext_RespectsNumCandidatesLimit()
+    public async Task GenerateNextConstant_RespectsNumCandidatesLimit()
     {
-        // Given: test atoms
-        await SeedTestAtomsWithPredictableSpatialRelationshipsAsync();
+        // Given: test constants
+        await SeedTestConstantsWithPredictableSpatialRelationshipsAsync();
 
         // When: generating with specific limit
-        var results = await _service.GenerateNextAsync(new long[] { 1, 2 }, numCandidates: 2);
+        var results = await _service.GenerateNextConstantAsync(new long[] { 1, 2 }, numCandidates: 2);
 
         // Then: should return at most requested number
         results.Count.Should().BeLessThanOrEqualTo(2,
@@ -440,32 +474,32 @@ public class AIQueryServiceTests : IDisposable
     }
 
     [Fact]
-    public async Task GenerateNext_EmptyContext_ThrowsArgumentException()
+    public async Task GenerateNextConstant_EmptyContext_ThrowsArgumentException()
     {
-        // Given: seeded atoms
-        await SeedTestAtomsWithPredictableSpatialRelationshipsAsync();
+        // Given: seeded constants
+        await SeedTestConstantsWithPredictableSpatialRelationshipsAsync();
 
         // When/Then: empty context should throw
-        var action = () => _service.GenerateNextAsync(Array.Empty<long>());
+        var action = async () => await _service.GenerateNextConstantAsync(Array.Empty<long>());
         await action.Should().ThrowAsync<ArgumentException>()
             .WithMessage("*Context cannot be empty*");
     }
 
     [Fact]
-    public async Task GenerateByAnalogy_FindsAtomNearPredictedPosition()
+    public async Task GenerateByAnalogy_FindsConstantNearPredictedPosition()
     {
-        // Given: atoms arranged for analogy test
+        // Given: constants arranged for analogy test
         // A (0.1, 0.1) to B (0.3, 0.3) defines vector (0.2, 0.2)
         // Applying to C (0.5, 0.5) predicts D at (0.7, 0.7)
-        var atoms = new List<Atom>
+        var constants = new List<Constant>
         {
-            CreateAtom(30, 0.1, 0.1, 0.0, 0.0, true, "char", 65),  // A
-            CreateAtom(31, 0.3, 0.3, 0.0, 0.0, true, "char", 66),  // B
-            CreateAtom(32, 0.5, 0.5, 0.0, 0.0, true, "char", 67),  // C
-            CreateAtom(33, 0.69, 0.69, 0.0, 0.0, true, "char", 68),  // D - near predicted
-            CreateAtom(34, 0.0, 0.0, 0.0, 0.0, true, "char", 69),  // E - far from predicted
+            CreateConstant(30, 0.1, 0.1, 0.0, 0.0, seedValue: 65),  // A
+            CreateConstant(31, 0.3, 0.3, 0.0, 0.0, seedValue: 66),  // B
+            CreateConstant(32, 0.5, 0.5, 0.0, 0.0, seedValue: 67),  // C
+            CreateConstant(33, 0.69, 0.69, 0.0, 0.0, seedValue: 68),  // D - near predicted
+            CreateConstant(34, 0.0, 0.0, 0.0, 0.0, seedValue: 69),  // E - far from predicted
         };
-        _context.Atoms.AddRange(atoms);
+        _context.Constants.AddRange(constants);
         await _context.SaveChangesAsync();
 
         // When: A is to B as C is to ?
@@ -473,39 +507,44 @@ public class AIQueryServiceTests : IDisposable
 
         // Then: D should be top candidate (closest to predicted position)
         results.Should().NotBeEmpty();
-        results[0].AtomId.Should().Be(33,
-            "Analogy generation MUST find atom closest to predicted position");
+        results[0].NodeId.Should().Be(33,
+            "Analogy generation MUST find constant closest to predicted position");
     }
 
     [Fact]
-    public async Task GenerateComposition_CreatesNewAtomWithRefs()
+    public async Task GenerateComposition_CreatesNewCompositionWithRelations()
     {
-        // Given: component atoms
-        await SeedTestAtomsWithPredictableSpatialRelationshipsAsync();
+        // Given: component constants
+        await SeedTestConstantsWithPredictableSpatialRelationshipsAsync();
         var components = new long[] { 1, 2, 3 };
 
-        // When: generating composition
-        var newId = await _service.GenerateCompositionAsync(components, "test_composition");
+        // When: generating composition (compositionTypeId is null for tests without type compositions)
+        var newId = await _service.GenerateCompositionAsync(components, compositionTypeId: null);
 
-        // Then: should create new atom referencing components
-        var newAtom = await _context.Atoms.FindAsync(newId);
-        newAtom.Should().NotBeNull();
-        newAtom!.IsConstant.Should().BeFalse("Compositions MUST NOT be constants");
-        newAtom.Refs.Should().BeEquivalentTo(components,
-            "Composition MUST reference all component atoms");
-        newAtom.AtomType.Should().Be("test_composition");
+        // Then: should create new composition referencing components
+        var newComposition = await _context.Compositions.FindAsync(newId);
+        newComposition.Should().NotBeNull("Composition MUST be created");
+        
+        // Verify composition references via Relation table
+        var relations = await _context.Relations
+            .Where(r => r.CompositionId == newId)
+            .OrderBy(r => r.Position)
+            .Select(r => r.ChildConstantId)
+            .ToListAsync();
+        relations.Should().BeEquivalentTo(components,
+            "Composition MUST reference all component constants via Relation");
     }
 
     [Fact]
     public async Task GenerateComposition_DeduplicatesIdenticalComposition()
     {
-        // Given: component atoms
-        await SeedTestAtomsWithPredictableSpatialRelationshipsAsync();
+        // Given: component constants
+        await SeedTestConstantsWithPredictableSpatialRelationshipsAsync();
         var components = new long[] { 1, 2 };
 
         // When: generating same composition twice
-        var firstId = await _service.GenerateCompositionAsync(components, "dedup_test");
-        var secondId = await _service.GenerateCompositionAsync(components, "dedup_test");
+        var firstId = await _service.GenerateCompositionAsync(components, compositionTypeId: null);
+        var secondId = await _service.GenerateCompositionAsync(components, compositionTypeId: null);
 
         // Then: should return same ID (deduplication)
         secondId.Should().Be(firstId,

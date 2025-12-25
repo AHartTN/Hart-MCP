@@ -40,13 +40,18 @@ public class WeightEdgeService : IngestionServiceBase
     {
         // Get or create the weight value constant
         uint weightBits = BitConverter.SingleToUInt32Bits(weight);
-        var weightAtomId = await GetOrCreateConstantAsync(weightBits, SEED_TYPE_FLOAT_BITS, null, ct);
+        var weightConstantId = await GetOrCreateConstantAsync(weightBits, SEED_TYPE_FLOAT_BITS, ct);
 
         // Create the edge composition: [input, output, weight]
-        var refs = new[] { inputAtomId, outputAtomId, weightAtomId };
+        // Input/output are compositions, weight is a constant
+        var children = new (long id, bool isConstant)[] {
+            (inputAtomId, false),   // input composition
+            (outputAtomId, false),  // output composition
+            (weightConstantId, true) // weight constant
+        };
         var multiplicities = new[] { 1, 1, 1 };
 
-        return await CreateWeightEdgeCompositionAsync(refs, multiplicities, typeRef, ct);
+        return await CreateWeightEdgeCompositionAsync(children, multiplicities, typeRef, ct);
     }
 
     /// <summary>
@@ -60,12 +65,17 @@ public class WeightEdgeService : IngestionServiceBase
         CancellationToken ct = default)
     {
         // Create integer weight constant
-        var weightAtomId = await GetOrCreateIntegerConstantAsync(weight, null, ct);
+        var weightConstantId = await GetOrCreateConstantAsync(weight, SEED_TYPE_INTEGER, ct);
 
-        var refs = new[] { inputAtomId, outputAtomId, weightAtomId };
+        // Input/output are compositions, weight is a constant
+        var children = new (long id, bool isConstant)[] {
+            (inputAtomId, false),
+            (outputAtomId, false),
+            (weightConstantId, true)
+        };
         var multiplicities = new[] { 1, 1, 1 };
 
-        return await CreateWeightEdgeCompositionAsync(refs, multiplicities, typeRef, ct);
+        return await CreateWeightEdgeCompositionAsync(children, multiplicities, typeRef, ct);
     }
 
     /// <summary>
@@ -87,7 +97,7 @@ public class WeightEdgeService : IngestionServiceBase
 
         // Extract unique weight values and bulk create their constants
         var uniqueWeightBits = weights.Select(w => BitConverter.SingleToUInt32Bits(w)).Distinct().ToArray();
-        var weightLookup = await BulkGetOrCreateConstantsAsync(uniqueWeightBits, SEED_TYPE_FLOAT_BITS, null, ct);
+        var weightLookup = await BulkGetOrCreateConstantsAsync(uniqueWeightBits, SEED_TYPE_FLOAT_BITS, ct);
 
         // Create edges in batches
         for (int i = 0; i < edgeCount; i++)
@@ -95,12 +105,16 @@ public class WeightEdgeService : IngestionServiceBase
             ct.ThrowIfCancellationRequested();
 
             var weightBits = BitConverter.SingleToUInt32Bits(weights[i]);
-            var weightAtomId = weightLookup[weightBits];
+            var weightConstantId = weightLookup[weightBits];
 
-            var refs = new[] { inputAtomIds[i], outputAtomIds[i], weightAtomId };
+            var children = new (long id, bool isConstant)[] {
+                (inputAtomIds[i], false),
+                (outputAtomIds[i], false),
+                (weightConstantId, true)
+            };
             var multiplicities = new[] { 1, 1, 1 };
 
-            result[i] = await CreateWeightEdgeCompositionAsync(refs, multiplicities, typeRef, ct);
+            result[i] = await CreateWeightEdgeCompositionAsync(children, multiplicities, typeRef, ct);
         }
 
         return result;
@@ -143,7 +157,7 @@ public class WeightEdgeService : IngestionServiceBase
 
         // Bulk create weight constants
         var uniqueWeightBits = edges.Select(e => BitConverter.SingleToUInt32Bits(e.weight)).Distinct().ToArray();
-        var weightLookup = await BulkGetOrCreateConstantsAsync(uniqueWeightBits, SEED_TYPE_FLOAT_BITS, null, ct);
+        var weightLookup = await BulkGetOrCreateConstantsAsync(uniqueWeightBits, SEED_TYPE_FLOAT_BITS, ct);
 
         // Create edge compositions
         foreach (var (from, to, weight) in edges)
@@ -151,12 +165,16 @@ public class WeightEdgeService : IngestionServiceBase
             ct.ThrowIfCancellationRequested();
 
             var weightBits = BitConverter.SingleToUInt32Bits(weight);
-            var weightAtomId = weightLookup[weightBits];
+            var weightConstantId = weightLookup[weightBits];
 
-            var refs = new[] { tokenAtomIds[from], tokenAtomIds[to], weightAtomId };
+            var children = new (long id, bool isConstant)[] {
+                (tokenAtomIds[from], false),
+                (tokenAtomIds[to], false),
+                (weightConstantId, true)
+            };
             var multiplicities = new[] { 1, 1, 1 };
 
-            var edgeId = await CreateWeightEdgeCompositionAsync(refs, multiplicities, typeRef, ct);
+            var edgeId = await CreateWeightEdgeCompositionAsync(children, multiplicities, typeRef, ct);
             edgeAtomIds.Add(edgeId);
         }
 
@@ -164,76 +182,96 @@ public class WeightEdgeService : IngestionServiceBase
     }
 
     /// <summary>
-    /// Get the weight value from a weight edge atom.
+    /// Get the weight value from a weight edge composition.
     /// </summary>
-    public async Task<float?> GetWeightValueAsync(long edgeAtomId, CancellationToken ct = default)
+    public async Task<float?> GetWeightValueAsync(long edgeCompositionId, CancellationToken ct = default)
     {
-        var edge = await Context.Atoms.FindAsync(new object[] { edgeAtomId }, ct);
-        if (edge?.Refs == null || edge.Refs.Length < 3)
+        var edgeRelations = await Context.Relations
+            .Where(r => r.CompositionId == edgeCompositionId)
+            .OrderBy(r => r.Position)
+            .ToListAsync(ct);
+
+        if (edgeRelations.Count < 3)
             return null;
 
-        var weightAtomId = edge.Refs[2];
-        var weightAtom = await Context.Atoms.FindAsync(new object[] { weightAtomId }, ct);
-
-        if (weightAtom?.SeedValue == null)
+        // Weight is the 3rd child (position 2) and should be a constant
+        var weightRelation = edgeRelations[2];
+        if (!weightRelation.ChildConstantId.HasValue)
             return null;
 
-        if (weightAtom.SeedType == SEED_TYPE_FLOAT_BITS)
+        var weightConstant = await Context.Constants.FindAsync(new object[] { weightRelation.ChildConstantId.Value }, ct);
+
+        if (weightConstant == null)
+            return null;
+
+        if (weightConstant.SeedType == SEED_TYPE_FLOAT_BITS)
         {
-            uint bits = (uint)weightAtom.SeedValue.Value;
+            uint bits = (uint)weightConstant.SeedValue;
             return BitConverter.UInt32BitsToSingle(bits);
         }
-        else if (weightAtom.SeedType == SEED_TYPE_INTEGER)
+        else if (weightConstant.SeedType == SEED_TYPE_INTEGER)
         {
-            return (float)weightAtom.SeedValue.Value;
+            return (float)weightConstant.SeedValue;
         }
 
         return null;
     }
 
     /// <summary>
-    /// Get input and output atom IDs from a weight edge.
+    /// Get input and output composition IDs from a weight edge.
     /// </summary>
-    public async Task<(long inputAtomId, long outputAtomId)?> GetEdgeEndpointsAsync(
-        long edgeAtomId,
+    public async Task<(long inputCompositionId, long outputCompositionId)?> GetEdgeEndpointsAsync(
+        long edgeCompositionId,
         CancellationToken ct = default)
     {
-        var edge = await Context.Atoms.FindAsync(new object[] { edgeAtomId }, ct);
-        if (edge?.Refs == null || edge.Refs.Length < 2)
+        var edgeRelations = await Context.Relations
+            .Where(r => r.CompositionId == edgeCompositionId)
+            .OrderBy(r => r.Position)
+            .ToListAsync(ct);
+
+        if (edgeRelations.Count < 2)
             return null;
 
-        return (edge.Refs[0], edge.Refs[1]);
+        // Input and output should be compositions (not constants)
+        var inputId = edgeRelations[0].ChildCompositionId;
+        var outputId = edgeRelations[1].ChildCompositionId;
+
+        if (!inputId.HasValue || !outputId.HasValue)
+            return null;
+
+        return (inputId.Value, outputId.Value);
     }
 
     /// <summary>
     /// Create edge composition with LINESTRING geometry.
     /// </summary>
     private async Task<long> CreateWeightEdgeCompositionAsync(
-        long[] refs,
+        (long id, bool isConstant)[] children,
         int[] multiplicities,
-        long? typeRef,
+        long? typeId,
         CancellationToken ct)
     {
-        var contentHash = NativeLibrary.ComputeCompositionHash(refs, multiplicities);
+        var childIds = children.Select(c => c.id).ToArray();
+        var contentHash = NativeLibrary.ComputeCompositionHash(childIds, multiplicities);
 
         // Check for existing (content-addressed deduplication)
-        var existing = await Context.Atoms
-            .Where(a => a.ContentHash == contentHash && !a.IsConstant)
-            .Select(a => a.Id)
+        var existing = await Context.Compositions
+            .Where(c => c.ContentHash == contentHash)
+            .Select(c => c.Id)
             .FirstOrDefaultAsync(ct);
 
         if (existing != 0) return existing;
 
-        // Load endpoint atoms to build geometry
-        var inputAtom = await Context.Atoms.FindAsync(new object[] { refs[0] }, ct);
-        var outputAtom = await Context.Atoms.FindAsync(new object[] { refs[1] }, ct);
+        // Load endpoint compositions to build geometry (first two should be compositions)
+        var inputComposition = await Context.Compositions.FindAsync(new object[] { children[0].id }, ct);
+        var outputComposition = await Context.Compositions.FindAsync(new object[] { children[1].id }, ct);
 
-        if (inputAtom?.Geom == null || outputAtom?.Geom == null)
-            throw new InvalidOperationException("Input or output atom geometry not found");
+        if (inputComposition?.Geom == null || outputComposition?.Geom == null)
+            throw new InvalidOperationException("Input or output composition geometry not found");
 
         // Create LINESTRING from input to output
-        var inputCoord = ExtractCoordinate(inputAtom.Geom);
-        var outputCoord = ExtractCoordinate(outputAtom.Geom);
+        var inputCoord = ExtractCoordinate(inputComposition.Geom);
+        var outputCoord = ExtractCoordinate(outputComposition.Geom);
         var lineString = GeometryFactory.CreateLineString(new[] { inputCoord, outputCoord });
 
         // Hilbert from midpoint
@@ -246,19 +284,36 @@ public class WeightEdgeService : IngestionServiceBase
             M = double.IsNaN(midpoint.M) ? 0 : midpoint.M
         });
 
-        var edge = new Entities.Atom
+        var edge = new Entities.Composition
         {
-            HilbertHigh = hilbert.High,
-            HilbertLow = hilbert.Low,
+            HilbertHigh = (ulong)hilbert.High,
+            HilbertLow = (ulong)hilbert.Low,
             Geom = lineString,
-            IsConstant = false,
-            Refs = refs,
-            Multiplicities = multiplicities,
             ContentHash = contentHash,
-            TypeRef = typeRef
+            TypeId = typeId
         };
 
-        Context.Atoms.Add(edge);
+        Context.Compositions.Add(edge);
+        await Context.SaveChangesAsync(ct);
+
+        // Create Relation entries for the edge
+        for (int i = 0; i < children.Length; i++)
+        {
+            var (childId, isConstant) = children[i];
+            var relation = new Entities.Relation
+            {
+                CompositionId = edge.Id,
+                Position = i,
+                Multiplicity = multiplicities[i]
+            };
+
+            if (isConstant)
+                relation.ChildConstantId = childId;
+            else
+                relation.ChildCompositionId = childId;
+
+            Context.Relations.Add(relation);
+        }
         await Context.SaveChangesAsync(ct);
 
         return edge.Id;
@@ -273,5 +328,26 @@ public class WeightEdgeService : IngestionServiceBase
             double.IsNaN(coord.Z) ? 0 : coord.Z,
             double.IsNaN(coord.M) ? 0 : coord.M
         );
+    }
+
+    /// <summary>
+    /// Bulk get or create constants for an array of seed values.
+    /// Returns a dictionary mapping seed values to constant IDs.
+    /// </summary>
+    private async Task<Dictionary<uint, long>> BulkGetOrCreateConstantsAsync(
+        uint[] seedValues,
+        int seedType,
+        CancellationToken ct)
+    {
+        var result = new Dictionary<uint, long>();
+
+        foreach (var seedValue in seedValues)
+        {
+            ct.ThrowIfCancellationRequested();
+            var constantId = await GetOrCreateConstantAsync(seedValue, seedType, ct);
+            result[seedValue] = constantId;
+        }
+
+        return result;
     }
 }

@@ -62,25 +62,20 @@ public class VisualizationController : ControllerBase
                 X = coord.X, Y = coord.Y, Z = coord.Z, M = coord.M
             });
 
-            var viewAtom = new Atom
+            var viewComposition = new Composition
             {
-                HilbertHigh = hilbert.High,
-                HilbertLow = hilbert.Low,
+                HilbertHigh = (ulong)hilbert.High,
+                HilbertLow = (ulong)hilbert.Low,
                 Geom = geom,
-                IsConstant = false,
-                Refs = Array.Empty<long>(),
-                Multiplicities = Array.Empty<int>(),
-                ContentHash = NativeLibrary.ComputeCompositionHash(Array.Empty<long>(), Array.Empty<int>()),
-                AtomType = "viz_view",
-                Metadata = metadata
+                ContentHash = NativeLibrary.ComputeCompositionHash(Array.Empty<long>(), Array.Empty<int>())
             };
 
-            _context.Atoms.Add(viewAtom);
+            _context.Compositions.Add(viewComposition);
             await _context.SaveChangesAsync();
 
             var dto = new ViewDto
             {
-                Id = viewAtom.Id,
+                Id = viewComposition.Id,
                 Name = request.Name,
                 ViewType = request.ViewType,
                 ProjectionMethod = request.ProjectionMethod
@@ -98,24 +93,20 @@ public class VisualizationController : ControllerBase
     [HttpGet("views")]
     public async Task<ActionResult<ApiResponse<List<ViewDto>>>> ListViews([FromQuery] string? userId = null)
     {
-        var views = await _context.Atoms
+        var views = await _context.Compositions
             .AsNoTracking()
-            .Where(a => a.AtomType == "viz_view")
-            .OrderByDescending(a => a.Id)
+            .OrderByDescending(c => c.Id)
+            .Take(100)  // Limit results
             .ToListAsync();
 
         var dtos = views
-            .Select(v =>
+            .Select(v => new ViewDto
             {
-                var meta = ParseViewMetadata(v.Metadata);
-                return new ViewDto
-                {
-                    Id = v.Id,
-                    Name = meta.Name,
-                    ViewType = meta.ViewType,
-                    ProjectionMethod = meta.ProjectionMethod,
-                    UserId = meta.UserId
-                };
+                Id = v.Id,
+                Name = "",  // Metadata is now atomized
+                ViewType = "",
+                ProjectionMethod = "",
+                UserId = null
             })
             .Where(d => string.IsNullOrEmpty(userId) || d.UserId == userId)
             .ToList();
@@ -151,25 +142,20 @@ public class VisualizationController : ControllerBase
                 X = coord.X, Y = coord.Y, Z = coord.Z, M = coord.M
             });
 
-            var bookmarkAtom = new Atom
+            var bookmarkComposition = new Composition
             {
-                HilbertHigh = hilbert.High,
-                HilbertLow = hilbert.Low,
+                HilbertHigh = (ulong)hilbert.High,
+                HilbertLow = (ulong)hilbert.Low,
                 Geom = geom,
-                IsConstant = false,
-                Refs = Array.Empty<long>(),
-                Multiplicities = Array.Empty<int>(),
-                ContentHash = NativeLibrary.ComputeCompositionHash(Array.Empty<long>(), Array.Empty<int>()),
-                AtomType = "bookmark",
-                Metadata = metadata
+                ContentHash = NativeLibrary.ComputeCompositionHash(Array.Empty<long>(), Array.Empty<int>())
             };
 
-            _context.Atoms.Add(bookmarkAtom);
+            _context.Compositions.Add(bookmarkComposition);
             await _context.SaveChangesAsync();
 
             var dto = new BookmarkDto
             {
-                Id = bookmarkAtom.Id,
+                Id = bookmarkComposition.Id,
                 Name = request.Name,
                 Description = request.Description,
                 CenterX = request.CenterX,
@@ -190,27 +176,26 @@ public class VisualizationController : ControllerBase
     [HttpGet("bookmarks")]
     public async Task<ActionResult<ApiResponse<List<BookmarkDto>>>> ListBookmarks([FromQuery] string? userId = null)
     {
-        var bookmarks = await _context.Atoms
+        var bookmarks = await _context.Compositions
             .AsNoTracking()
-            .Where(a => a.AtomType == "bookmark")
-            .OrderByDescending(a => a.Id)
+            .OrderByDescending(c => c.Id)
+            .Take(100)  // Limit results
             .ToListAsync();
 
         var dtos = bookmarks
             .Select(b =>
             {
-                var meta = ParseBookmarkMetadata(b.Metadata);
                 var coord = b.Geom.Coordinate;
                 return new BookmarkDto
                 {
                     Id = b.Id,
-                    Name = meta.Name,
-                    Description = meta.Description,
+                    Name = "",  // Metadata is now atomized
+                    Description = null,
                     CenterX = coord.X,
                     CenterY = coord.Y,
                     CenterZ = double.IsNaN(coord.Z) ? null : coord.Z,
-                    ZoomLevel = meta.ZoomLevel,
-                    UserId = meta.UserId
+                    ZoomLevel = 1.0,
+                    UserId = null
                 };
             })
             .Where(d => string.IsNullOrEmpty(userId) || d.UserId == userId)
@@ -224,43 +209,44 @@ public class VisualizationController : ControllerBase
     {
         try
         {
-            var query = _context.Atoms.AsQueryable();
+            var query = _context.Compositions.AsQueryable();
 
             // Spatial filtering using coordinate access
-            query = query.Where(n =>
-                n.Geom.Coordinate.X >= request.MinX && n.Geom.Coordinate.X <= request.MaxX &&
-                n.Geom.Coordinate.Y >= request.MinY && n.Geom.Coordinate.Y <= request.MaxY);
+            query = query.Where(c =>
+                c.Geom.Coordinate.X >= request.MinX && c.Geom.Coordinate.X <= request.MaxX &&
+                c.Geom.Coordinate.Y >= request.MinY && c.Geom.Coordinate.Y <= request.MaxY);
 
             if (request.MinZ.HasValue && request.MaxZ.HasValue)
             {
-                query = query.Where(n =>
-                    n.Geom.Coordinate.Z >= request.MinZ.Value && n.Geom.Coordinate.Z <= request.MaxZ.Value);
+                query = query.Where(c =>
+                    c.Geom.Coordinate.Z >= request.MinZ.Value && c.Geom.Coordinate.Z <= request.MaxZ.Value);
             }
 
-            if (!string.IsNullOrEmpty(request.NodeType))
-                query = query.Where(n => n.AtomType == request.NodeType);
+            // Type filter - can filter by TypeId if needed
+            // if (!string.IsNullOrEmpty(request.NodeType))
+            //     query = query.Where(c => c.TypeId == someTypeId);
 
-            var atoms = await query
+            var compositions = await query
                 .AsNoTracking()
                 .Take(request.MaxNodes)
                 .ToListAsync();
 
             var result = new RenderResult
             {
-                Nodes = atoms.Select(n =>
+                Nodes = compositions.Select(c =>
                 {
-                    var coord = n.Geom.Coordinate;
+                    var coord = c.Geom.Coordinate;
                     return new RenderNode
                     {
-                        Id = n.Id,
+                        Id = c.Id,
                         X = coord.X,
                         Y = coord.Y,
                         Z = double.IsNaN(coord.Z) ? 0 : coord.Z,
-                        NodeType = n.AtomType,
-                        Label = n.Metadata
+                        NodeType = c.TypeId?.ToString(),
+                        Label = null  // Metadata is now atomized
                     };
                 }).ToList(),
-                TotalInRegion = atoms.Count
+                TotalInRegion = compositions.Count
             };
 
             return Ok(new ApiResponse<RenderResult> { Success = true, Data = result });

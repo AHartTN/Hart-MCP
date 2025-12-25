@@ -37,18 +37,17 @@ public class ImageIngestionService : IngestionServiceBase, IIngestionService<Ima
         Logger?.LogDebug("Found {UniqueCount} unique pixels", uniquePixels.Count);
 
         // ============================================
-        // PHASE 2: BULK create ALL pixel constants (ONE DB round-trip)
+        // PHASE 2: BULK create ALL pixel constants
         // ============================================
         var pixelLookup = await BulkGetOrCreateConstantsAsync(
             uniquePixels.ToArray(),
             SEED_TYPE_INTEGER,
-            null,
             ct);
 
         // ============================================
         // PHASE 3: Build row compositions (using lookup, minimal DB ops)
         // ============================================
-        var rowAtomIds = new long[image.Height];
+        var rowCompositionIds = new long[image.Height];
 
         for (int y = 0; y < image.Height; y++)
         {
@@ -58,84 +57,108 @@ public class ImageIngestionService : IngestionServiceBase, IIngestionService<Ima
             // RLE compress the row
             var (refs, mults) = CompressRow(rowPixels);
 
-            // Map pixel values to atom IDs using dictionary (O(1) per pixel, NO DB)
-            var pixelAtomIds = new long[refs.Length];
+            // Map pixel values to constant IDs using dictionary (O(1) per pixel, NO DB)
+            var pixelConstantIds = new long[refs.Length];
             for (int i = 0; i < refs.Length; i++)
             {
-                pixelAtomIds[i] = pixelLookup[refs[i]];
+                pixelConstantIds[i] = pixelLookup[refs[i]];
             }
 
-            // Create row composition
-            rowAtomIds[y] = await CreateCompositionAsync(pixelAtomIds, mults, null, ct);
+            // Create row composition from constants
+            rowCompositionIds[y] = await CreateCompositionFromConstantsAsync(pixelConstantIds, mults, null, ct);
         }
 
         // ============================================
         // PHASE 4: Create image composition from rows
         // ============================================
+        var rowChildren = rowCompositionIds.Select(id => (id, isConstant: false)).ToArray();
         var imageId = await CreateCompositionAsync(
-            rowAtomIds,
-            Enumerable.Repeat(1, rowAtomIds.Length).ToArray(),
+            rowChildren,
+            Enumerable.Repeat(1, rowCompositionIds.Length).ToArray(),
             null,
             ct
         );
 
         // Store dimensions as metadata composition: [image, width, height]
-        var widthAtom = await GetOrCreateConstantAsync((uint)image.Width, SEED_TYPE_INTEGER, null, ct);
-        var heightAtom = await GetOrCreateConstantAsync((uint)image.Height, SEED_TYPE_INTEGER, null, ct);
+        var widthConstant = await GetOrCreateConstantAsync((uint)image.Width, SEED_TYPE_INTEGER, ct);
+        var heightConstant = await GetOrCreateConstantAsync((uint)image.Height, SEED_TYPE_INTEGER, ct);
+        var metaChildren = new (long id, bool isConstant)[] {
+            (imageId, false),
+            (widthConstant, true),
+            (heightConstant, true)
+        };
         var metaId = await CreateCompositionAsync(
-            new[] { imageId, widthAtom, heightAtom },
+            metaChildren,
             new[] { 1, 1, 1 },
             null,
             ct
         );
 
-        Logger?.LogInformation("Ingested image as atom {AtomId}", metaId);
+        Logger?.LogInformation("Ingested image as composition {CompositionId}", metaId);
         return metaId;
     }
 
     public async Task<ImageData> ReconstructAsync(long compositionId, CancellationToken ct = default)
     {
-        var meta = await Context.Atoms.FindAsync(new object[] { compositionId }, ct);
-
-        if (meta?.Refs == null || meta.Refs.Length != 3)
-            throw new InvalidOperationException($"Invalid image meta atom {compositionId}");
-
-        var imageAtomId = meta.Refs[0];
-        var widthAtomId = meta.Refs[1];
-        var heightAtomId = meta.Refs[2];
-
-        var dims = await Context.Atoms
-            .Where(a => a.Id == widthAtomId || a.Id == heightAtomId)
+        // Get meta composition relations via Relation table
+        var metaRelations = await Context.Relations
+            .Where(r => r.CompositionId == compositionId)
+            .OrderBy(r => r.Position)
             .ToListAsync(ct);
 
-        var width = (int)(dims.First(d => d.Id == widthAtomId).SeedValue ?? 0);
-        var height = (int)(dims.First(d => d.Id == heightAtomId).SeedValue ?? 0);
+        if (metaRelations.Count != 3)
+            throw new InvalidOperationException($"Invalid image meta composition {compositionId}");
 
-        var imageAtom = await Context.Atoms.FindAsync(new object[] { imageAtomId }, ct);
+        var imageCompositionId = metaRelations[0].ChildCompositionId!.Value;
+        var widthConstantId = metaRelations[1].ChildConstantId!.Value;
+        var heightConstantId = metaRelations[2].ChildConstantId!.Value;
 
-        if (imageAtom?.Refs == null)
-            throw new InvalidOperationException("Invalid image atom");
+        var dims = await Context.Constants
+            .Where(c => c.Id == widthConstantId || c.Id == heightConstantId)
+            .ToListAsync(ct);
+
+        var width = (int)dims.First(d => d.Id == widthConstantId).SeedValue;
+        var height = (int)dims.First(d => d.Id == heightConstantId).SeedValue;
+
+        // Get row relations for image composition
+        var rowRelations = await Context.Relations
+            .Where(r => r.CompositionId == imageCompositionId)
+            .OrderBy(r => r.Position)
+            .ToListAsync(ct);
+
+        if (rowRelations.Count == 0)
+            throw new InvalidOperationException("Invalid image composition");
 
         var pixels = new uint[width * height];
-        var rowAtoms = await Context.Atoms
-            .Where(a => imageAtom.Refs.Contains(a.Id))
-            .ToDictionaryAsync(a => a.Id, ct);
 
-        for (int y = 0; y < imageAtom.Refs.Length && y < height; y++)
+        for (int y = 0; y < rowRelations.Count && y < height; y++)
         {
-            var rowAtom = rowAtoms[imageAtom.Refs[y]];
-            if (rowAtom.Refs == null) continue;
+            // Get pixel relations for row
+            var rowCompositionId = rowRelations[y].ChildCompositionId ?? throw new InvalidOperationException("Row relation missing child composition");
+            var pixelRelations = await Context.Relations
+                .Where(r => r.CompositionId == rowCompositionId)
+                .OrderBy(r => r.Position)
+                .ToListAsync(ct);
 
-            var pixelConstants = await Context.Atoms
-                .Where(a => rowAtom.Refs.Contains(a.Id) && a.IsConstant)
-                .ToDictionaryAsync(a => a.Id, ct);
+            if (pixelRelations.Count == 0) continue;
+
+            var pixelConstantIds = pixelRelations
+                .Where(r => r.ChildConstantId.HasValue)
+                .Select(r => r.ChildConstantId!.Value)
+                .Distinct()
+                .ToList();
+            var pixelConstants = await Context.Constants
+                .Where(c => pixelConstantIds.Contains(c.Id))
+                .ToDictionaryAsync(c => c.Id, ct);
 
             int x = 0;
-            for (int i = 0; i < rowAtom.Refs.Length && x < width; i++)
+            foreach (var pixelRelation in pixelRelations)
             {
-                var pixelAtom = pixelConstants[rowAtom.Refs[i]];
-                var mult = rowAtom.Multiplicities?[i] ?? 1;
-                var pixelValue = (uint)(pixelAtom.SeedValue ?? 0);
+                if (x >= width) break;
+                
+                var pixelConstant = pixelConstants[pixelRelation.ChildConstantId!.Value];
+                var mult = pixelRelation.Multiplicity;
+                var pixelValue = (uint)pixelConstant.SeedValue;
 
                 for (int m = 0; m < mult && x < width; m++)
                 {
@@ -167,6 +190,27 @@ public class ImageIngestionService : IngestionServiceBase, IIngestionService<Ima
         }
 
         return (refs.ToArray(), mults.ToArray());
+    }
+
+    /// <summary>
+    /// Bulk get or create constants for an array of seed values.
+    /// Returns a dictionary mapping seed values to constant IDs.
+    /// </summary>
+    private async Task<Dictionary<uint, long>> BulkGetOrCreateConstantsAsync(
+        uint[] seedValues,
+        int seedType,
+        CancellationToken ct)
+    {
+        var result = new Dictionary<uint, long>();
+
+        foreach (var seedValue in seedValues)
+        {
+            ct.ThrowIfCancellationRequested();
+            var constantId = await GetOrCreateConstantAsync(seedValue, seedType, ct);
+            result[seedValue] = constantId;
+        }
+
+        return result;
     }
 }
 

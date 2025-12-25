@@ -10,8 +10,8 @@ using System.Diagnostics;
 namespace Hart.MCP.Api.Controllers;
 
 /// <summary>
-/// SpatialNodes are now just atoms. This controller provides backward-compatible
-/// endpoints that work with the unified atom table.
+/// SpatialNodes are now Compositions. This controller provides backward-compatible
+/// endpoints that work with the Compositions table.
 /// </summary>
 [ApiController]
 [Route("api/[controller]")]
@@ -38,17 +38,17 @@ public class SpatialNodesController : ControllerBase
             var merkleHashBytes = Convert.FromHexString(merkleHashHex);
 
             // Check for existing by content hash
-            var existing = await _context.Atoms
-                .Where(a => a.ContentHash == merkleHashBytes)
-                .Select(a => a.Id)
+            var existing = await _context.Compositions
+                .Where(c => c.ContentHash == merkleHashBytes)
+                .Select(c => c.Id)
                 .FirstOrDefaultAsync();
 
             if (existing != 0)
             {
-                var existingAtom = await _context.Atoms.FindAsync(existing);
-                if (existingAtom != null)
+                var existingComposition = await _context.Compositions.FindAsync(existing);
+                if (existingComposition != null)
                 {
-                    var existingDto = MapToDto(existingAtom);
+                    var existingDto = MapToDto(existingComposition);
                     return Ok(new ApiResponse<SpatialNodeDto> { Success = true, Data = existingDto });
                 }
             }
@@ -59,23 +59,19 @@ public class SpatialNodesController : ControllerBase
                     X = request.X, Y = request.Y, Z = request.Z, M = request.M
                 });
 
-            var atom = new Atom
+            var composition = new Composition
             {
-                HilbertHigh = hilbert.High,
-                HilbertLow = hilbert.Low,
+                HilbertHigh = (ulong)hilbert.High,
+                HilbertLow = (ulong)hilbert.Low,
                 Geom = location,
-                IsConstant = false,
-                Refs = Array.Empty<long>(),
-                Multiplicities = Array.Empty<int>(),
                 ContentHash = merkleHashBytes,
-                AtomType = request.NodeType ?? "node",
-                Metadata = request.Metadata
+                TypeId = null  // Can be set later if needed
             };
 
-            _context.Atoms.Add(atom);
+            _context.Compositions.Add(composition);
             await _context.SaveChangesAsync();
 
-            var dto = MapToDto(atom);
+            var dto = MapToDto(composition);
             return Ok(new ApiResponse<SpatialNodeDto> { Success = true, Data = dto });
         }
         catch (Exception ex)
@@ -93,27 +89,27 @@ public class SpatialNodesController : ControllerBase
         {
             var centerPoint = _geometryFactory.CreatePoint(new Coordinate(request.CenterX, request.CenterY));
 
-            var query = _context.Atoms.AsQueryable();
+            var query = _context.Compositions.AsQueryable();
 
             // Spatial distance filter
-            query = query.Where(n => n.Geom.Distance(centerPoint) <= request.Radius);
+            query = query.Where(c => c.Geom != null && c.Geom.Distance(centerPoint) <= request.Radius);
 
             // Z-dimension filter
             if (request.MinZ.HasValue)
-                query = query.Where(n => n.Geom.Coordinate.Z >= request.MinZ.Value);
+                query = query.Where(c => c.Geom != null && c.Geom.Coordinate.Z >= request.MinZ.Value);
             if (request.MaxZ.HasValue)
-                query = query.Where(n => n.Geom.Coordinate.Z <= request.MaxZ.Value);
+                query = query.Where(c => c.Geom != null && c.Geom.Coordinate.Z <= request.MaxZ.Value);
 
-            // Type filter
-            if (!string.IsNullOrEmpty(request.NodeType))
-                query = query.Where(n => n.AtomType == request.NodeType);
+            // Type filter - can filter by TypeId if needed
+            // if (!string.IsNullOrEmpty(request.NodeType))
+            //     query = query.Where(c => c.TypeId == someTypeId);
 
-            var atoms = await query
+            var compositions = await query
                 .AsNoTracking()
                 .Take(request.MaxResults)
                 .ToListAsync();
 
-            var results = atoms.Select(MapToDto).ToList();
+            var results = compositions.Select(MapToDto).ToList();
 
             sw.Stop();
 
@@ -136,27 +132,27 @@ public class SpatialNodesController : ControllerBase
     [HttpGet("{id}")]
     public async Task<ActionResult<ApiResponse<SpatialNodeDto>>> GetNode(long id)
     {
-        var atom = await _context.Atoms.FindAsync(id);
-        if (atom == null)
+        var composition = await _context.Compositions.FindAsync(id);
+        if (composition == null)
             return NotFound(new ApiResponse<SpatialNodeDto> { Success = false, Error = "Node not found" });
 
-        return Ok(new ApiResponse<SpatialNodeDto> { Success = true, Data = MapToDto(atom) });
+        return Ok(new ApiResponse<SpatialNodeDto> { Success = true, Data = MapToDto(composition) });
     }
 
-    private static SpatialNodeDto MapToDto(Atom atom)
+    private static SpatialNodeDto MapToDto(Composition composition)
     {
-        var coord = atom.Geom.Coordinate;
+        var coord = composition.Geom?.Coordinate ?? new Coordinate(0, 0);
         return new SpatialNodeDto(
-            atom.Id,
+            composition.Id,
             coord.X,
             coord.Y,
             double.IsNaN(coord.Z) ? 0 : coord.Z,
             double.IsNaN(coord.M) ? 0 : coord.M,
-            atom.AtomType,
-            Convert.ToHexString(atom.ContentHash),
-            null,  // ParentHash - legacy concept, refs now handle relationships
-            atom.Metadata,
-            DateTime.UtcNow  // We don't track created time in atoms - could add to metadata
+            composition.TypeId?.ToString(),  // NodeType from TypeId
+            Convert.ToHexString(composition.ContentHash),
+            null,  // ParentHash - legacy concept, Relations now handle relationships
+            null,  // Metadata - now atomized
+            DateTime.UtcNow  // CreatedAt - not stored on Composition, use current time
         );
     }
 

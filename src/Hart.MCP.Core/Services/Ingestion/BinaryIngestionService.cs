@@ -28,23 +28,23 @@ public class BinaryIngestionService : IngestionServiceBase, IIngestionService<by
 
         Logger?.LogInformation("Ingesting binary data: {Length} bytes", data.Length);
 
-        // Empty data is valid - return composition with 0 refs
+        // Empty data is valid - return composition with length constant only
         if (data.Length == 0)
         {
-            var lengthAtom = await GetOrCreateIntegerConstantAsync(0, null, ct);
-            return await CreateCompositionAsync(new[] { lengthAtom }, new[] { 1 }, null, ct);
+            var emptyLengthConstant = await GetOrCreateConstantAsync(0, SEED_TYPE_INTEGER, ct);
+            return await CreateCompositionFromConstantsAsync(new[] { emptyLengthConstant }, new[] { 1 }, null, ct);
         }
 
         // ============================================
-        // PHASE 1: BULK create all 256 byte constants (ONE DB round-trip)
+        // PHASE 1: BULK create all 256 byte constants
         // ============================================
         var allBytes = Enumerable.Range(0, 256).Select(b => (uint)b).ToArray();
-        var byteLookup = await BulkGetOrCreateConstantsAsync(allBytes, SEED_TYPE_INTEGER, null, ct);
+        var byteLookup = await BulkGetOrCreateConstantsAsync(allBytes, SEED_TYPE_INTEGER, ct);
 
         // ============================================
         // PHASE 2: Build chunk compositions (using lookup, minimal DB ops)
         // ============================================
-        var chunkAtomIds = new List<long>();
+        var chunkCompositionIds = new List<long>();
         int chunkCount = (data.Length + CHUNK_SIZE - 1) / CHUNK_SIZE;
 
         for (int c = 0; c < chunkCount; c++)
@@ -58,84 +58,111 @@ public class BinaryIngestionService : IngestionServiceBase, IIngestionService<by
             // RLE compress
             var (refs, mults) = CompressChunk(chunkBytes);
 
-            // Map byte values to atom IDs using dictionary (O(1) per byte, NO DB)
-            var byteAtomIds = new long[refs.Length];
+            // Map byte values to constant IDs using dictionary (O(1) per byte, NO DB)
+            var byteConstantIds = new long[refs.Length];
             for (int i = 0; i < refs.Length; i++)
             {
-                byteAtomIds[i] = byteLookup[refs[i]];
+                byteConstantIds[i] = byteLookup[refs[i]];
             }
 
-            var chunkId = await CreateCompositionAsync(byteAtomIds, mults, null, ct);
-            chunkAtomIds.Add(chunkId);
+            var chunkId = await CreateCompositionFromConstantsAsync(byteConstantIds, mults, null, ct);
+            chunkCompositionIds.Add(chunkId);
         }
 
         // ============================================
         // PHASE 3: Create binary composition
         // ============================================
+        var chunkChildren = chunkCompositionIds.Select(id => (id, isConstant: false)).ToArray();
         var binaryId = await CreateCompositionAsync(
-            chunkAtomIds.ToArray(),
-            Enumerable.Repeat(1, chunkAtomIds.Count).ToArray(),
+            chunkChildren,
+            Enumerable.Repeat(1, chunkCompositionIds.Count).ToArray(),
             null,
             ct
         );
 
-        // Store length as composition: [binary, length]
-        var lengthAtom = await GetOrCreateIntegerConstantAsync(data.Length, null, ct);
+        // Store length as metadata composition: [binary, length]
+        var lengthConstant = await GetOrCreateConstantAsync(data.Length, SEED_TYPE_INTEGER, ct);
+        var metaChildren = new (long id, bool isConstant)[] {
+            (binaryId, false),
+            (lengthConstant, true)
+        };
         var metaId = await CreateCompositionAsync(
-            new[] { binaryId, lengthAtom },
+            metaChildren,
             new[] { 1, 1 },
             null,
             ct
         );
 
-        Logger?.LogInformation("Ingested binary as atom {AtomId} ({ChunkCount} chunks)", metaId, chunkCount);
+        Logger?.LogInformation("Ingested binary as composition {CompositionId} ({ChunkCount} chunks)", metaId, chunkCount);
         return metaId;
     }
 
     public async Task<byte[]> ReconstructAsync(long compositionId, CancellationToken ct = default)
     {
-        var meta = await Context.Atoms.FindAsync(new object[] { compositionId }, ct);
+        // Get meta composition relations via Relation table
+        var metaRelations = await Context.Relations
+            .Where(r => r.CompositionId == compositionId)
+            .OrderBy(r => r.Position)
+            .ToListAsync(ct);
 
-        if (meta?.Refs == null || meta.Refs.Length < 1)
-            throw new InvalidOperationException($"Invalid binary meta atom {compositionId}");
+        if (metaRelations.Count < 1)
+            throw new InvalidOperationException($"Invalid binary meta composition {compositionId}");
 
         // Check for empty binary (only has length constant)
-        if (meta.Refs.Length == 1)
+        if (metaRelations.Count == 1)
         {
-            var lengthCheck = await Context.Atoms.FindAsync(new object[] { meta.Refs[0] }, ct);
-            if (lengthCheck?.IsConstant == true && lengthCheck.SeedValue == 0)
-                return Array.Empty<byte>();
+            var relation = metaRelations[0];
+            if (relation.ChildConstantId.HasValue)
+            {
+                var lengthCheck = await Context.Constants.FindAsync(new object[] { relation.ChildConstantId.Value }, ct);
+                if (lengthCheck?.SeedValue == 0)
+                    return Array.Empty<byte>();
+            }
         }
 
-        if (meta.Refs.Length != 2)
-            throw new InvalidOperationException($"Invalid binary meta atom {compositionId}");
+        if (metaRelations.Count != 2)
+            throw new InvalidOperationException($"Invalid binary meta composition {compositionId}");
 
-        var binaryAtomId = meta.Refs[0];
-        var lengthAtom = await Context.Atoms.FindAsync(new object[] { meta.Refs[1] }, ct);
-        var expectedLength = (int)(lengthAtom?.SeedValue ?? 0);
+        var binaryCompositionId = metaRelations[0].ChildCompositionId!.Value;
+        var lengthConstant = await Context.Constants.FindAsync(new object[] { metaRelations[1].ChildConstantId!.Value }, ct);
+        var expectedLength = (int)(lengthConstant?.SeedValue ?? 0);
 
-        var binaryAtom = await Context.Atoms.FindAsync(new object[] { binaryAtomId }, ct);
+        // Get chunk relations for binary composition
+        var chunkRelations = await Context.Relations
+            .Where(r => r.CompositionId == binaryCompositionId)
+            .OrderBy(r => r.Position)
+            .ToListAsync(ct);
 
-        if (binaryAtom?.Refs == null)
-            throw new InvalidOperationException("Invalid binary atom");
+        if (chunkRelations.Count == 0)
+            throw new InvalidOperationException("Invalid binary composition");
 
         var result = new List<byte>();
 
-        foreach (var chunkId in binaryAtom.Refs)
+        foreach (var chunkRelation in chunkRelations)
         {
-            var chunkAtom = await Context.Atoms.FindAsync(new object[] { chunkId }, ct);
+            // Get byte relations for chunk
+            var chunkCompositionId = chunkRelation.ChildCompositionId ?? throw new InvalidOperationException("Chunk relation missing child composition");
+            var byteRelations = await Context.Relations
+                .Where(r => r.CompositionId == chunkCompositionId)
+                .OrderBy(r => r.Position)
+                .ToListAsync(ct);
 
-            if (chunkAtom?.Refs == null) continue;
+            if (byteRelations.Count == 0) continue;
 
-            var byteConstants = await Context.Atoms
-                .Where(a => chunkAtom.Refs.Contains(a.Id) && a.IsConstant)
-                .ToDictionaryAsync(a => a.Id, ct);
+            var byteConstantIds = byteRelations
+                .Where(r => r.ChildConstantId.HasValue)
+                .Select(r => r.ChildConstantId!.Value)
+                .Distinct()
+                .ToList();
+            var byteConstants = await Context.Constants
+                .Where(c => byteConstantIds.Contains(c.Id))
+                .ToDictionaryAsync(c => c.Id, ct);
 
-            for (int i = 0; i < chunkAtom.Refs.Length; i++)
+            foreach (var byteRelation in byteRelations)
             {
-                var byteAtom = byteConstants[chunkAtom.Refs[i]];
-                var mult = chunkAtom.Multiplicities?[i] ?? 1;
-                var byteValue = (byte)(byteAtom.SeedValue ?? 0);
+                var byteConstant = byteConstants[byteRelation.ChildConstantId!.Value];
+                var mult = byteRelation.Multiplicity;
+                var byteValue = (byte)byteConstant.SeedValue;
 
                 for (int m = 0; m < mult; m++)
                 {
@@ -166,5 +193,26 @@ public class BinaryIngestionService : IngestionServiceBase, IIngestionService<by
         }
 
         return (refs.ToArray(), mults.ToArray());
+    }
+
+    /// <summary>
+    /// Bulk get or create constants for an array of seed values.
+    /// Returns a dictionary mapping seed values to constant IDs.
+    /// </summary>
+    private async Task<Dictionary<uint, long>> BulkGetOrCreateConstantsAsync(
+        uint[] seedValues,
+        int seedType,
+        CancellationToken ct)
+    {
+        var result = new Dictionary<uint, long>();
+
+        foreach (var seedValue in seedValues)
+        {
+            ct.ThrowIfCancellationRequested();
+            var constantId = await GetOrCreateConstantAsync(seedValue, seedType, ct);
+            result[seedValue] = constantId;
+        }
+
+        return result;
     }
 }

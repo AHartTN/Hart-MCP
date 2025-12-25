@@ -21,6 +21,8 @@ namespace Hart.MCP.Tests;
 /// </summary>
 public class HierarchicalTextIngestionServiceTests : IDisposable
 {
+    private const string ConnectionString = "Host=localhost;Port=5432;Database=HART-MCP;Username=hartonomous;Password=hartonomous";
+    
     private readonly HartDbContext _context;
     private readonly AtomIngestionService _atomService;
     private readonly HierarchicalTextIngestionService _service;
@@ -28,10 +30,12 @@ public class HierarchicalTextIngestionServiceTests : IDisposable
     public HierarchicalTextIngestionServiceTests()
     {
         var options = new DbContextOptionsBuilder<HartDbContext>()
-            .UseInMemoryDatabase(databaseName: $"HartMCP_Hierarchical_Test_{Guid.NewGuid()}")
+            .UseNpgsql(ConnectionString, o => o.UseNetTopologySuite())
             .Options;
 
         _context = new HartDbContext(options);
+        _context.Database.EnsureCreated();
+        
         var atomLogger = Mock.Of<ILogger<AtomIngestionService>>();
         var hierarchicalLogger = Mock.Of<ILogger<HierarchicalTextIngestionService>>();
         
@@ -41,7 +45,6 @@ public class HierarchicalTextIngestionServiceTests : IDisposable
 
     public void Dispose()
     {
-        _context.Database.EnsureDeleted();
         _context.Dispose();
     }
 
@@ -53,7 +56,7 @@ public class HierarchicalTextIngestionServiceTests : IDisposable
         const string original = "Hello, World!";
 
         var result = await _service.IngestTextHierarchicallyAsync(original);
-        var reconstructed = await _service.ReconstructTextAsync(result.RootAtomId);
+        var reconstructed = await _service.ReconstructTextAsync(result.RootAtomId, result.RootIsConstant);
 
         reconstructed.Should().Be(original,
             because: "hierarchical text reconstruction MUST be exactly lossless");
@@ -68,7 +71,7 @@ public class HierarchicalTextIngestionServiceTests : IDisposable
     public async Task LosslessReconstruction_TextsWithPatterns_PerfectlyPreserved(string original, string description)
     {
         var result = await _service.IngestTextHierarchicallyAsync(original);
-        var reconstructed = await _service.ReconstructTextAsync(result.RootAtomId);
+        var reconstructed = await _service.ReconstructTextAsync(result.RootAtomId, result.RootIsConstant);
 
         reconstructed.Should().Be(original,
             because: $"{description} must reconstruct exactly");
@@ -81,7 +84,7 @@ public class HierarchicalTextIngestionServiceTests : IDisposable
     public async Task LosslessReconstruction_NonLatinWithPatterns_Preserved(string original, string script)
     {
         var result = await _service.IngestTextHierarchicallyAsync(original);
-        var reconstructed = await _service.ReconstructTextAsync(result.RootAtomId);
+        var reconstructed = await _service.ReconstructTextAsync(result.RootAtomId, result.RootIsConstant);
 
         reconstructed.Should().Be(original,
             because: $"{script} with patterns must be perfectly preserved");
@@ -93,7 +96,7 @@ public class HierarchicalTextIngestionServiceTests : IDisposable
         const string original = "😀hello😀world😀"; // Emoji appears 3 times
 
         var result = await _service.IngestTextHierarchicallyAsync(original);
-        var reconstructed = await _service.ReconstructTextAsync(result.RootAtomId);
+        var reconstructed = await _service.ReconstructTextAsync(result.RootAtomId, result.RootIsConstant);
 
         reconstructed.Should().Be(original);
     }
@@ -119,7 +122,7 @@ public class HierarchicalTextIngestionServiceTests : IDisposable
         const string text = "the cat in the hat";
 
         var result = await _service.IngestTextHierarchicallyAsync(text);
-        var reconstructed = await _service.ReconstructTextAsync(result.RootAtomId);
+        var reconstructed = await _service.ReconstructTextAsync(result.RootAtomId, result.RootIsConstant);
 
         reconstructed.Should().Be(text);
         
@@ -160,7 +163,9 @@ public class HierarchicalTextIngestionServiceTests : IDisposable
 
         // But shared patterns like "Captain " should use the same underlying atoms
         // We can verify this by checking total atoms in DB is less than if no deduplication
-        var totalAtoms = await _context.Atoms.CountAsync();
+        var totalConstants = await _context.Constants.CountAsync();
+        var totalCompositions = await _context.Compositions.CountAsync();
+        var totalAtoms = totalConstants + totalCompositions;
         
         // Calculate what it would be without any pattern sharing
         var text1Chars = text1.Distinct().Count();
@@ -191,13 +196,14 @@ public class HierarchicalTextIngestionServiceTests : IDisposable
         // All should reconstruct correctly
         for (int i = 0; i < texts.Length; i++)
         {
-            var reconstructed = await _service.ReconstructTextAsync(results[i].RootAtomId);
+            var reconstructed = await _service.ReconstructTextAsync(results[i].RootAtomId, results[i].RootIsConstant);
             reconstructed.Should().Be(texts[i]);
         }
 
         // Character constants should be shared (e.g., 'h' appears in all three)
-        var charConstants = await _context.Atoms
-            .Where(a => a.IsConstant && a.AtomType == "char")
+        // Query constants by SeedType (0 = Unicode codepoint)
+        var charConstants = await _context.Constants
+            .Where(c => c.SeedType == 0)
             .CountAsync();
 
         // We shouldn't have duplicate character constants
@@ -276,7 +282,7 @@ public class HierarchicalTextIngestionServiceTests : IDisposable
         const string text = "a";
 
         var result = await _service.IngestTextHierarchicallyAsync(text);
-        var reconstructed = await _service.ReconstructTextAsync(result.RootAtomId);
+        var reconstructed = await _service.ReconstructTextAsync(result.RootAtomId, result.RootIsConstant);
 
         reconstructed.Should().Be(text);
         result.Tier0CharacterCount.Should().Be(1);
@@ -288,7 +294,7 @@ public class HierarchicalTextIngestionServiceTests : IDisposable
         const string text = "ab";
 
         var result = await _service.IngestTextHierarchicallyAsync(text);
-        var reconstructed = await _service.ReconstructTextAsync(result.RootAtomId);
+        var reconstructed = await _service.ReconstructTextAsync(result.RootAtomId, result.RootIsConstant);
 
         reconstructed.Should().Be(text);
     }
@@ -299,7 +305,7 @@ public class HierarchicalTextIngestionServiceTests : IDisposable
         const string text = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"; // 40 a's
 
         var result = await _service.IngestTextHierarchicallyAsync(text);
-        var reconstructed = await _service.ReconstructTextAsync(result.RootAtomId);
+        var reconstructed = await _service.ReconstructTextAsync(result.RootAtomId, result.RootIsConstant);
 
         reconstructed.Should().Be(text);
         result.FinalSequenceLength.Should().BeLessThan(text.Length,
@@ -318,7 +324,7 @@ public class HierarchicalTextIngestionServiceTests : IDisposable
         var text = sb.ToString();
 
         var result = await _service.IngestTextHierarchicallyAsync(text);
-        var reconstructed = await _service.ReconstructTextAsync(result.RootAtomId);
+        var reconstructed = await _service.ReconstructTextAsync(result.RootAtomId, result.RootIsConstant);
 
         reconstructed.Should().Be(text);
         result.TotalPatternsDiscovered.Should().BeGreaterThan(0,
@@ -345,7 +351,7 @@ public class HierarchicalTextIngestionServiceTests : IDisposable
         const string text = "   \t\n   ";
 
         var result = await _service.IngestTextHierarchicallyAsync(text);
-        var reconstructed = await _service.ReconstructTextAsync(result.RootAtomId);
+        var reconstructed = await _service.ReconstructTextAsync(result.RootAtomId, result.RootIsConstant);
 
         reconstructed.Should().Be(text);
     }
@@ -395,7 +401,7 @@ public class HierarchicalTextIngestionServiceTests : IDisposable
         const string text = "the cat the dog the bird";
 
         var result = await _service.IngestTextHierarchicallyAsync(text);
-        var reconstructed = await _service.ReconstructTextAsync(result.RootAtomId);
+        var reconstructed = await _service.ReconstructTextAsync(result.RootAtomId, result.RootIsConstant);
 
         reconstructed.Should().Be(text);
         result.TotalPatternsDiscovered.Should().BeGreaterThan(0);

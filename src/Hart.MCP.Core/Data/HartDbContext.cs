@@ -1,12 +1,11 @@
 using Hart.MCP.Core.Entities;
 using Microsoft.EntityFrameworkCore;
-using NetTopologySuite.Geometries;
 
 namespace Hart.MCP.Core.Data;
 
 /// <summary>
-/// EF Core DbContext for HART-MCP database
-/// Single-table design: everything stored in 'atom' table
+/// EF Core DbContext for HART-MCP database.
+/// Three tables: constant (leaf nodes), composition (internal nodes), relation (edges).
 /// </summary>
 public class HartDbContext : DbContext
 {
@@ -14,21 +13,39 @@ public class HartDbContext : DbContext
     {
     }
 
-    public DbSet<Atom> Atoms { get; set; } = null!;
+    public DbSet<Constant> Constants { get; set; } = null!;
+    public DbSet<Composition> Compositions { get; set; } = null!;
+    public DbSet<Relation> Relations { get; set; } = null!;
 
     protected override void OnModelCreating(ModelBuilder modelBuilder)
     {
         base.OnModelCreating(modelBuilder);
 
-        modelBuilder.Entity<Atom>(entity =>
+        modelBuilder.HasPostgresExtension("postgis");
+
+        // --- Constant Configuration ---
+        modelBuilder.Entity<Constant>(entity =>
         {
-            entity.ToTable("atom");
+            entity.ToTable("constant");
 
             entity.HasKey(e => e.Id);
 
             entity.Property(e => e.Id)
                 .HasColumnName("id")
                 .ValueGeneratedOnAdd();
+
+            entity.Property(e => e.SeedValue)
+                .HasColumnName("seed_value")
+                .IsRequired();
+
+            entity.Property(e => e.SeedType)
+                .HasColumnName("seed_type")
+                .IsRequired();
+
+            entity.Property(e => e.ContentHash)
+                .HasColumnName("content_hash")
+                .HasMaxLength(32)
+                .IsRequired();
 
             entity.Property(e => e.HilbertHigh)
                 .HasColumnName("hilbert_high")
@@ -40,87 +57,130 @@ public class HartDbContext : DbContext
 
             entity.Property(e => e.Geom)
                 .HasColumnName("geom")
-                .HasColumnType("geometry(GeometryZM, 0)")
-                .IsRequired();
+                .HasColumnType("geometry(PointZM, 0)");
 
-            entity.Property(e => e.IsConstant)
-                .HasColumnName("is_constant")
-                .IsRequired();
+            // Indexes
+            entity.HasIndex(e => e.ContentHash)
+                .IsUnique();
 
-            entity.Property(e => e.SeedValue)
-                .HasColumnName("seed_value");
+            entity.HasIndex(e => new { e.SeedType, e.SeedValue });
 
-            entity.Property(e => e.SeedType)
-                .HasColumnName("seed_type");
+            entity.HasIndex(e => new { e.HilbertHigh, e.HilbertLow });
 
-            entity.Property(e => e.Refs)
-                .HasColumnName("refs");
+            entity.HasIndex(e => e.Geom)
+                .HasMethod("GIST");
+        });
 
-            entity.Property(e => e.Multiplicities)
-                .HasColumnName("multiplicities");
+        // --- Composition Configuration ---
+        modelBuilder.Entity<Composition>(entity =>
+        {
+            entity.ToTable("composition");
+
+            entity.HasKey(e => e.Id);
+
+            entity.Property(e => e.Id)
+                .HasColumnName("id")
+                .ValueGeneratedOnAdd();
 
             entity.Property(e => e.ContentHash)
                 .HasColumnName("content_hash")
                 .HasMaxLength(32)
                 .IsRequired();
 
-            entity.Property(e => e.TypeRef)
-                .HasColumnName("type_ref");
+            entity.Property(e => e.HilbertHigh)
+                .HasColumnName("hilbert_high")
+                .IsRequired();
 
-            entity.Property(e => e.Descriptors)
-                .HasColumnName("descriptors");
+            entity.Property(e => e.HilbertLow)
+                .HasColumnName("hilbert_low")
+                .IsRequired();
 
-            entity.Property(e => e.CreatedAt)
-                .HasColumnName("created_at")
-                .HasDefaultValueSql("NOW()")
-                .ValueGeneratedOnAdd();
+            entity.Property(e => e.Geom)
+                .HasColumnName("geom")
+                .HasColumnType("geometry(GeometryZM, 0)");
 
-            // Indexes for performance
-            entity.HasIndex(e => e.Geom)
-                .HasMethod("GIST");
+            entity.Property(e => e.TypeId)
+                .HasColumnName("type_id");
 
-            entity.HasIndex(e => new { e.HilbertHigh, e.HilbertLow });
+            // Self-reference for type
+            entity.HasOne(e => e.Type)
+                .WithMany()
+                .HasForeignKey(e => e.TypeId)
+                .OnDelete(DeleteBehavior.SetNull);
 
+            // Indexes
             entity.HasIndex(e => e.ContentHash)
                 .IsUnique();
 
-            entity.HasIndex(e => e.IsConstant);
+            entity.HasIndex(e => new { e.HilbertHigh, e.HilbertLow });
 
-            entity.HasIndex(e => e.TypeRef);
+            entity.HasIndex(e => e.Geom)
+                .HasMethod("GIST");
 
-            entity.HasIndex(e => e.SeedValue);
-
-            entity.HasIndex(e => e.CreatedAt);
-
-            // GIN index for descriptors array containment queries
-            entity.HasIndex(e => e.Descriptors)
-                .HasMethod("GIN");
-
-            // GIN index for refs array containment queries
-            entity.HasIndex(e => e.Refs)
-                .HasMethod("GIN");
+            entity.HasIndex(e => e.TypeId);
         });
-    }
 
-    /// <summary>
-    /// Seed database with full Unicode (1.1M codepoints) using native bulk ingestion.
-    /// Call this after EnsureCreated() or after migrations.
-    /// </summary>
-    public async Task SeedUnicodeAsync(string connectionString, bool fullUnicode = true)
-    {
-        // Check if already seeded - look for character constants
-        var hasUnicode = await Atoms.AnyAsync(a => a.IsConstant && a.SeedType == 0);
-        if (hasUnicode)
-            return;
+        // --- Relation Configuration ---
+        modelBuilder.Entity<Relation>(entity =>
+        {
+            entity.ToTable("relation");
 
-        var service = new Hart.MCP.Core.Services.Ingestion.NativeBulkIngestionService(connectionString);
-        try
-        {
-            await service.SeedUnicodeAsync(fullUnicode);
-        }
-        finally
-        {
-            service.Dispose();
-        }
+            entity.HasKey(e => e.Id);
+
+            entity.Property(e => e.Id)
+                .HasColumnName("id")
+                .ValueGeneratedOnAdd();
+
+            entity.Property(e => e.CompositionId)
+                .HasColumnName("composition_id")
+                .IsRequired();
+
+            entity.Property(e => e.ChildConstantId)
+                .HasColumnName("child_constant_id");
+
+            entity.Property(e => e.ChildCompositionId)
+                .HasColumnName("child_composition_id");
+
+            entity.Property(e => e.Position)
+                .HasColumnName("position")
+                .IsRequired();
+
+            entity.Property(e => e.Multiplicity)
+                .HasColumnName("multiplicity")
+                .IsRequired()
+                .HasDefaultValue(1);
+
+            // FK: Parent composition
+            entity.HasOne(r => r.Composition)
+                .WithMany(c => c.OutgoingRelations)
+                .HasForeignKey(r => r.CompositionId)
+                .OnDelete(DeleteBehavior.Cascade);
+
+            // FK: Child constant
+            entity.HasOne(r => r.ChildConstant)
+                .WithMany(c => c.IncomingRelations)
+                .HasForeignKey(r => r.ChildConstantId)
+                .OnDelete(DeleteBehavior.Cascade);
+
+            // FK: Child composition
+            entity.HasOne(r => r.ChildComposition)
+                .WithMany(c => c.IncomingRelations)
+                .HasForeignKey(r => r.ChildCompositionId)
+                .OnDelete(DeleteBehavior.Cascade);
+
+            // Indexes
+            entity.HasIndex(e => e.CompositionId);
+
+            entity.HasIndex(e => e.ChildConstantId);
+
+            entity.HasIndex(e => e.ChildCompositionId);
+
+            // Unique: one position per parent
+            entity.HasIndex(e => new { e.CompositionId, e.Position })
+                .IsUnique();
+
+            // Check constraint: exactly one child type
+            // Note: EF Core doesn't support check constraints directly, add in migration
+        });
     }
 }

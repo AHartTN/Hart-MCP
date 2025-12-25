@@ -10,8 +10,8 @@ using System.Text.Json;
 namespace Hart.MCP.Api.Controllers;
 
 /// <summary>
-/// Conversations are atoms with AtomType="conversation".
-/// Conversation turns are atoms with AtomType="turn" that reference the conversation.
+/// Conversations are compositions with related turns.
+/// Conversation turns are compositions that reference the conversation via Relations.
 /// </summary>
 [ApiController]
 [Route("api/[controller]")]
@@ -42,29 +42,24 @@ public class ConversationsController : ControllerBase
                 startedAt = DateTime.UtcNow
             });
 
-            // Create conversation atom at origin (will be updated as turns accumulate)
+            // Create conversation composition at origin (will be updated as turns accumulate)
             var geom = _geometryFactory.CreatePoint(new CoordinateZM(0, 0, 0, 0));
             var hilbert = NativeLibrary.point_to_hilbert(new NativeLibrary.PointZM { X = 0, Y = 0, Z = 0, M = 0 });
 
-            var conversationAtom = new Atom
+            var conversationComposition = new Composition
             {
-                HilbertHigh = hilbert.High,
-                HilbertLow = hilbert.Low,
+                HilbertHigh = (ulong)hilbert.High,
+                HilbertLow = (ulong)hilbert.Low,
                 Geom = geom,
-                IsConstant = false,
-                Refs = Array.Empty<long>(),
-                Multiplicities = Array.Empty<int>(),
-                ContentHash = NativeLibrary.ComputeCompositionHash(Array.Empty<long>(), Array.Empty<int>()),
-                AtomType = "conversation",
-                Metadata = metadata
+                ContentHash = NativeLibrary.ComputeCompositionHash(Array.Empty<long>(), Array.Empty<int>())
             };
 
-            _context.Atoms.Add(conversationAtom);
+            _context.Compositions.Add(conversationComposition);
             await _context.SaveChangesAsync();
 
             var dto = new ConversationDto
             {
-                Id = conversationAtom.Id,
+                Id = conversationComposition.Id,
                 SessionType = request.SessionType,
                 UserId = request.UserId,
                 Metadata = request.Metadata,
@@ -88,16 +83,16 @@ public class ConversationsController : ControllerBase
     {
         try
         {
-            var session = await _context.Atoms
-                .FirstOrDefaultAsync(a => a.Id == sessionId && a.AtomType == "conversation");
+            var session = await _context.Compositions
+                .FirstOrDefaultAsync(c => c.Id == sessionId);
 
             if (session == null)
                 return NotFound(new ApiResponse<TurnDto> { Success = false, Error = "Session not found" });
 
-            // Get current turn count
-            var turnCount = session.Refs?.Length ?? 0;
+            // Get current turn count from Relations
+            var turnCount = await _context.Relations.CountAsync(r => r.CompositionId == sessionId);
 
-            // Create turn atom with spatial coordinates if provided
+            // Create turn composition with spatial coordinates if provided
             var coord = new CoordinateZM(
                 request.SpatialX ?? turnCount,  // Use turn number as X if not provided
                 request.SpatialY ?? 0,
@@ -119,31 +114,29 @@ public class ConversationsController : ControllerBase
                 X = coord.X, Y = coord.Y, Z = coord.Z, M = coord.M
             });
 
-            var turnAtom = new Atom
+            var turnComposition = new Composition
             {
-                HilbertHigh = hilbert.High,
-                HilbertLow = hilbert.Low,
+                HilbertHigh = (ulong)hilbert.High,
+                HilbertLow = (ulong)hilbert.Low,
                 Geom = turnGeom,
-                IsConstant = false,
-                Refs = new[] { sessionId },  // Turn references its session
-                Multiplicities = new[] { 1 },
-                ContentHash = NativeLibrary.ComputeCompositionHash(new[] { sessionId, turnCount + 1 }, new[] { 1, 1 }),
-                AtomType = "turn",
-                Metadata = turnMetadata
+                ContentHash = NativeLibrary.ComputeCompositionHash(new[] { sessionId, turnCount + 1 }, new[] { 1, 1 })
             };
 
-            _context.Atoms.Add(turnAtom);
-
-            // Update session to reference all turns
-            var newRefs = (session.Refs ?? Array.Empty<long>()).Append(turnAtom.Id).ToArray();
-            session.Refs = newRefs;
-            session.Multiplicities = Enumerable.Repeat(1, newRefs.Length).ToArray();
-
+            _context.Compositions.Add(turnComposition);
             await _context.SaveChangesAsync();
+
+            // Create Relation linking session to turn
+            _context.Relations.Add(new Relation
+            {
+                CompositionId = sessionId,
+                ChildCompositionId = turnComposition.Id,
+                Position = turnCount,
+                Multiplicity = 1
+            });
 
             var dto = new TurnDto
             {
-                Id = turnAtom.Id,
+                Id = turnComposition.Id,
                 SessionId = sessionId,
                 TurnNumber = turnCount + 1,
                 Role = request.Role,
@@ -164,23 +157,24 @@ public class ConversationsController : ControllerBase
     [HttpGet("sessions/{sessionId}")]
     public async Task<ActionResult<ApiResponse<ConversationDto>>> GetSession(long sessionId)
     {
-        var session = await _context.Atoms
+        var session = await _context.Compositions
             .AsNoTracking()
-            .FirstOrDefaultAsync(a => a.Id == sessionId && a.AtomType == "conversation");
+            .FirstOrDefaultAsync(c => c.Id == sessionId);
 
         if (session == null)
             return NotFound(new ApiResponse<ConversationDto> { Success = false, Error = "Session not found" });
 
-        var meta = ParseConversationMetadata(session.Metadata);
+        // Get turn count from Relations
+        var turnCount = await _context.Relations.CountAsync(r => r.CompositionId == sessionId);
 
         var dto = new ConversationDto
         {
             Id = session.Id,
-            SessionType = meta.SessionType,
-            UserId = meta.UserId,
-            Metadata = meta.Data,
-            StartedAt = meta.StartedAt,
-            TurnCount = session.Refs?.Length ?? 0
+            SessionType = "",  // Metadata is now atomized
+            UserId = null,
+            Metadata = null,
+            StartedAt = DateTime.UtcNow, // Composition doesn't have CreatedAt
+            TurnCount = turnCount
         };
 
         return Ok(new ApiResponse<ConversationDto> { Success = true, Data = dto });
@@ -192,32 +186,33 @@ public class ConversationsController : ControllerBase
         [FromQuery] string? sessionType = null,
         [FromQuery] int limit = 50)
     {
-        var query = _context.Atoms
-            .AsNoTracking()
-            .Where(a => a.AtomType == "conversation");
+        var query = _context.Compositions
+            .AsNoTracking();
 
+        // Get all compositions (sessions are compositions)
         var sessions = await query
-            .OrderByDescending(a => a.Id)
-            .Take(limit * 2)  // Over-fetch to filter
+            .OrderByDescending(c => c.Id)
+            .Take(limit)
             .ToListAsync();
 
+        // Get turn counts for all sessions
+        var sessionIds = sessions.Select(s => s.Id).ToList();
+        var turnCounts = await _context.Relations
+            .Where(r => sessionIds.Contains(r.CompositionId))
+            .GroupBy(r => r.CompositionId)
+            .Select(g => new { CompositionId = g.Key, Count = g.Count() })
+            .ToDictionaryAsync(x => x.CompositionId, x => x.Count);
+
         var dtos = sessions
-            .Select(s =>
+            .Select(s => new ConversationDto
             {
-                var meta = ParseConversationMetadata(s.Metadata);
-                return new ConversationDto
-                {
-                    Id = s.Id,
-                    SessionType = meta.SessionType,
-                    UserId = meta.UserId,
-                    Metadata = meta.Data,
-                    StartedAt = meta.StartedAt,
-                    TurnCount = s.Refs?.Length ?? 0
-                };
+                Id = s.Id,
+                SessionType = "",
+                UserId = null,
+                Metadata = null,
+                StartedAt = DateTime.UtcNow, // Composition doesn't have CreatedAt
+                TurnCount = turnCounts.GetValueOrDefault(s.Id, 0)
             })
-            .Where(d =>
-                (string.IsNullOrEmpty(userId) || d.UserId == userId) &&
-                (string.IsNullOrEmpty(sessionType) || d.SessionType == sessionType))
             .Take(limit)
             .ToList();
 

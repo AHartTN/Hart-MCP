@@ -134,10 +134,11 @@ public class HierarchicalTextIngestionService
         // ============================================
         // PHASE 3: Batch persist to database
         // ============================================
-        var rootAtomId = await BatchPersistGrammarAsync(
+        var (rootAtomId, rootIsConstant) = await BatchPersistGrammarAsync(
             codepoints, uniqueCodepoints, finalSequence, rules, cancellationToken);
 
         result.RootAtomId = rootAtomId;
+        result.RootIsConstant = rootIsConstant;
 
         stopwatch.Stop();
         result.ProcessingTimeMs = stopwatch.ElapsedMilliseconds;
@@ -270,8 +271,9 @@ public class HierarchicalTextIngestionService
 
     /// <summary>
     /// Batch persist the grammar to database in minimal round-trips.
+    /// Returns (rootId, isConstant) tuple.
     /// </summary>
-    private async Task<long> BatchPersistGrammarAsync(
+    private async Task<(long RootId, bool IsConstant)> BatchPersistGrammarAsync(
         List<int> originalCodepoints,
         HashSet<int> uniqueCodepoints,
         List<int> finalSequence,
@@ -317,8 +319,11 @@ public class HierarchicalTextIngestionService
 
         if (rootRefs.Count == 1 && rootMults[0] == 1)
         {
-            // Single element - just return that atom
-            return rootRefs[0];
+            // Single element - determine if it's a constant or composition
+            var singleRef = rootRefs[0];
+            // If it's in charAtomLookup values, it's a constant
+            bool isConstant = charAtomLookup.Values.Contains(singleRef);
+            return (singleRef, isConstant);
         }
 
         var rootAtomId = await CreateOrGetCompositionAsync(
@@ -327,7 +332,7 @@ public class HierarchicalTextIngestionService
             "document",
             cancellationToken);
 
-        return rootAtomId;
+        return (rootAtomId, false); // Compositions are never constants
     }
 
     /// <summary>
@@ -381,38 +386,58 @@ public class HierarchicalTextIngestionService
     private async Task<long> CreateOrGetCompositionAsync(
         long[] refs,
         int[] multiplicities,
-        string atomType,
+        string compositionType,
         CancellationToken cancellationToken)
     {
-        // Compute deterministic hash
-        var contentHash = NativeLibrary.ComputeCompositionHash(refs, multiplicities);
+        // First determine which refs are constants and which are compositions
+        var constantChildren = await _context.Constants
+            .Where(c => refs.Contains(c.Id))
+            .ToDictionaryAsync(c => c.Id, cancellationToken);
+
+        var compositionChildren = await _context.Compositions
+            .Where(c => refs.Contains(c.Id))
+            .ToDictionaryAsync(c => c.Id, cancellationToken);
+
+        // Build child type array for typed hash
+        var childIsConstant = new Dictionary<long, bool>();
+        foreach (var refId in refs)
+        {
+            if (constantChildren.ContainsKey(refId))
+                childIsConstant[refId] = true;
+            else if (compositionChildren.ContainsKey(refId))
+                childIsConstant[refId] = false;
+            else
+                throw new InvalidOperationException($"Referenced node {refId} not found in Constants or Compositions");
+        }
+
+        // Compute typed hash that distinguishes constant vs composition children
+        var contentHash = ComputeTypedCompositionHash(refs, multiplicities, childIsConstant);
 
         // Check if already exists (deduplication across ALL ingested content)
-        var existing = await _context.Atoms
-            .Where(a => a.ContentHash == contentHash && !a.IsConstant)
-            .Select(a => a.Id)
+        var existing = await _context.Compositions
+            .Where(c => c.ContentHash == contentHash)
+            .Select(c => c.Id)
             .FirstOrDefaultAsync(cancellationToken);
 
         if (existing != 0)
         {
-            _logger?.LogTrace("Deduplication hit: composition with hash {Hash} already exists as atom {Id}",
+            _logger?.LogTrace("Deduplication hit: composition with hash {Hash} already exists as {Id}",
                 Convert.ToHexString(contentHash), existing);
             return existing;
         }
-
-        // Load child atoms to compute geometry
-        var children = await _context.Atoms
-            .Where(a => refs.Contains(a.Id))
-            .ToDictionaryAsync(a => a.Id, cancellationToken);
 
         // Build geometry from child points
         var coordinates = new List<CoordinateZM>();
         foreach (var refId in refs)
         {
-            if (!children.TryGetValue(refId, out var child))
-                throw new InvalidOperationException($"Referenced atom {refId} not found");
-
-            coordinates.Add(ExtractRepresentativeCoordinate(child.Geom));
+            if (constantChildren.TryGetValue(refId, out var constantChild))
+            {
+                coordinates.Add(ExtractRepresentativeCoordinate(constantChild.Geom));
+            }
+            else if (compositionChildren.TryGetValue(refId, out var compositionChild))
+            {
+                coordinates.Add(ExtractRepresentativeCoordinate(compositionChild.Geom));
+            }
         }
 
         Geometry geom;
@@ -434,22 +459,35 @@ public class HierarchicalTextIngestionService
             M = double.IsNaN(centroid.M) ? 0 : centroid.M
         });
 
-        var atom = new Atom
+        var composition = new Composition
         {
-            HilbertHigh = hilbert.High,
-            HilbertLow = hilbert.Low,
+            HilbertHigh = (ulong)hilbert.High,
+            HilbertLow = (ulong)hilbert.Low,
             Geom = geom,
-            IsConstant = false,
-            Refs = refs,
-            Multiplicities = multiplicities,
-            ContentHash = contentHash,
-            TypeRef = null // Type determined by structure
+            ContentHash = contentHash
         };
 
-        _context.Atoms.Add(atom);
+        _context.Compositions.Add(composition);
         await _context.SaveChangesAsync(cancellationToken);
 
-        return atom.Id;
+        // Create Relation entries for composition edges
+        for (int i = 0; i < refs.Length; i++)
+        {
+            var relation = new Relation
+            {
+                CompositionId = composition.Id,
+                Position = i,
+                Multiplicity = multiplicities[i]
+            };
+            if (childIsConstant[refs[i]])
+                relation.ChildConstantId = refs[i];
+            else
+                relation.ChildCompositionId = refs[i];
+            _context.Relations.Add(relation);
+        }
+        await _context.SaveChangesAsync(cancellationToken);
+
+        return composition.Id;
     }
 
     /// <summary>
@@ -463,18 +501,15 @@ public class HierarchicalTextIngestionService
         var codepointsAsLong = codepoints.Select(cp => (long)cp).ToList();
 
         // Single query for existing
-        var existing = await _context.Atoms
-            .Where(a => a.IsConstant && a.SeedType == 0 && // SEED_TYPE_UNICODE
-                       a.SeedValue.HasValue && codepointsAsLong.Contains(a.SeedValue.Value))
-            .Select(a => new { a.Id, a.SeedValue })
+        var existing = await _context.Constants
+            .Where(c => c.SeedType == 0 && // SEED_TYPE_UNICODE
+                       codepointsAsLong.Contains(c.SeedValue))
+            .Select(c => new { c.Id, c.SeedValue })
             .ToListAsync(cancellationToken);
 
-        foreach (var atom in existing)
+        foreach (var constant in existing)
         {
-            if (atom.SeedValue.HasValue)
-            {
-                result[(uint)atom.SeedValue.Value] = atom.Id;
-            }
+            result[(uint)constant.SeedValue] = constant.Id;
         }
 
         // Create missing
@@ -488,41 +523,65 @@ public class HierarchicalTextIngestionService
                 var hilbert = NativeLibrary.point_to_hilbert(point);
                 var geom = _geometryFactory.CreatePoint(new CoordinateZM(point.X, point.Y, point.Z, point.M));
 
-                var atom = new Atom
+                var constant = new Constant
                 {
-                    HilbertHigh = hilbert.High,
-                    HilbertLow = hilbert.Low,
+                    HilbertHigh = (ulong)hilbert.High,
+                    HilbertLow = (ulong)hilbert.Low,
                     Geom = geom,
-                    IsConstant = true,
                     SeedValue = cp,
                     SeedType = 0, // Unicode
-                    ContentHash = contentHash,
-                    TypeRef = null // Character constant - type determined by SeedType
+                    ContentHash = contentHash
                 };
 
-                _context.Atoms.Add(atom);
+                _context.Constants.Add(constant);
                 result[cp] = 0; // Placeholder, will be set after save
             }
 
             await _context.SaveChangesAsync(cancellationToken);
 
             // Re-query to get assigned IDs
-            var newlyCreated = await _context.Atoms
-                .Where(a => a.IsConstant && a.SeedType == 0 && // SEED_TYPE_UNICODE
-                           a.SeedValue.HasValue && missing.Select(m => (long)m).Contains(a.SeedValue.Value))
-                .Select(a => new { a.Id, a.SeedValue })
+            var newlyCreated = await _context.Constants
+                .Where(c => c.SeedType == 0 && // SEED_TYPE_UNICODE
+                           missing.Select(m => (long)m).Contains(c.SeedValue))
+                .Select(c => new { c.Id, c.SeedValue })
                 .ToListAsync(cancellationToken);
 
-            foreach (var atom in newlyCreated)
+            foreach (var constant in newlyCreated)
             {
-                if (atom.SeedValue.HasValue)
-                {
-                    result[(uint)atom.SeedValue.Value] = atom.Id;
-                }
+                result[(uint)constant.SeedValue] = constant.Id;
             }
         }
 
         return result;
+    }
+
+    /// <summary>
+    /// Compute typed composition hash that includes child types to prevent collisions.
+    /// </summary>
+    private static byte[] ComputeTypedCompositionHash(
+        long[] refs,
+        int[] multiplicities,
+        Dictionary<long, bool> childIsConstant)
+    {
+        using var sha256 = System.Security.Cryptography.SHA256.Create();
+        
+        // Get base hash from native library
+        var baseHash = NativeLibrary.ComputeCompositionHash(refs, multiplicities);
+        
+        // Add child type indicators to make hash unique based on constant vs composition
+        var typeBytes = new byte[(refs.Length + 7) / 8];
+        for (int i = 0; i < refs.Length; i++)
+        {
+            if (childIsConstant[refs[i]])
+                typeBytes[i / 8] |= (byte)(1 << (i % 8));
+        }
+        
+        // Combine base hash with type bytes
+        var combined = new byte[baseHash.Length + typeBytes.Length];
+        baseHash.CopyTo(combined, 0);
+        typeBytes.CopyTo(combined, baseHash.Length);
+        
+        return sha256.ComputeHash(combined);
     }
 
     /// <summary>
@@ -568,7 +627,7 @@ public class HierarchicalTextIngestionService
     }
 
     /// <summary>
-    /// Query for all atoms containing a specific substring pattern.
+    /// Query for all compositions containing a specific substring pattern.
     /// Finds compositions at any tier that include the pattern.
     /// </summary>
     public async Task<List<long>> FindCompositionsContainingPatternAsync(
@@ -578,59 +637,116 @@ public class HierarchicalTextIngestionService
         if (string.IsNullOrEmpty(pattern))
             return new List<long>();
 
-        // First, ingest the pattern to get its atom representation
+        // First, ingest the pattern to get its composition representation
         var patternResult = await IngestTextHierarchicallyAsync(pattern, cancellationToken);
-        var patternAtomId = patternResult.RootAtomId;
+        var patternCompositionId = patternResult.RootAtomId;
 
-        // Now find all compositions that reference this pattern atom
-        // This works because identical patterns produce identical atoms (content-addressed)
-        var containingAtoms = await _context.Atoms
-            .Where(a => !a.IsConstant && a.Refs != null && a.Refs.Contains(patternAtomId))
-            .Select(a => a.Id)
+        // Now find all compositions that reference this pattern via Relations table
+        var containingCompositions = await _context.Relations
+            .Where(r => r.ChildCompositionId == patternCompositionId)
+            .Select(r => r.CompositionId)
+            .Distinct()
             .ToListAsync(cancellationToken);
 
-        return containingAtoms;
+        return containingCompositions;
     }
 
     /// <summary>
-    /// Reconstruct the original text from a composition atom.
+    /// Reconstruct the original text from a node (constant or composition).
     /// Recursively expands all references.
     /// </summary>
     public async Task<string> ReconstructTextAsync(
-        long atomId,
+        long nodeId,
         CancellationToken cancellationToken = default)
     {
-        var atom = await _context.Atoms.FindAsync(new object[] { atomId }, cancellationToken);
-        if (atom == null)
-            throw new ArgumentException($"Atom {atomId} not found");
+        // When called without type hint, try composition first (most common case),
+        // then fall back to constant
+        return await ReconstructTextAsync(nodeId, isConstant: null, cancellationToken);
+    }
 
-        if (atom.IsConstant)
+    /// <summary>
+    /// Reconstruct the original text from a node (constant or composition).
+    /// Recursively expands all references.
+    /// </summary>
+    /// <param name="nodeId">The ID of the node to reconstruct</param>
+    /// <param name="isConstant">If known, whether the node is a constant (true) or composition (false). Null to auto-detect.</param>
+    /// <param name="cancellationToken">Cancellation token</param>
+    public async Task<string> ReconstructTextAsync(
+        long nodeId,
+        bool? isConstant,
+        CancellationToken cancellationToken = default)
+    {
+        // If we know it's a constant, check that first
+        if (isConstant == true)
         {
-            // Base case: character constant
-            if (atom.SeedType == 0 && atom.SeedValue.HasValue) // Unicode
+            var constant = await _context.Constants.FindAsync(new object[] { nodeId }, cancellationToken);
+            if (constant != null)
             {
-                return char.ConvertFromUtf32((int)atom.SeedValue.Value);
+                if (constant.SeedType == 0) // Unicode
+                {
+                    return char.ConvertFromUtf32((int)constant.SeedValue);
+                }
+                return "";
             }
-            return "";
+            throw new ArgumentException($"Node {nodeId} not found in Constants (isConstant was true)");
         }
 
-        // Composition: recursively reconstruct
-        var sb = new StringBuilder();
-        if (atom.Refs != null && atom.Multiplicities != null)
+        // If we know it's a composition (or auto-detecting), check composition first
+        var composition = await _context.Compositions.FindAsync(new object[] { nodeId }, cancellationToken);
+        if (composition != null)
         {
-            for (int i = 0; i < atom.Refs.Length; i++)
+            // Composition: get relations ordered by position
+            var relations = await _context.Relations
+                .Where(r => r.CompositionId == nodeId)
+                .OrderBy(r => r.Position)
+                .ToListAsync(cancellationToken);
+
+            if (relations.Count == 0)
+                return "";
+
+            var sb = new StringBuilder();
+            foreach (var relation in relations)
             {
-                var childText = await ReconstructTextAsync(atom.Refs[i], cancellationToken);
-                var multiplicity = atom.Multiplicities[i];
-                
-                for (int m = 0; m < multiplicity; m++)
+                string childText;
+                if (relation.ChildConstantId.HasValue)
+                {
+                    // We know it's a constant via the relation
+                    childText = await ReconstructTextAsync(relation.ChildConstantId.Value, isConstant: true, cancellationToken);
+                }
+                else if (relation.ChildCompositionId.HasValue)
+                {
+                    // We know it's a composition via the relation
+                    childText = await ReconstructTextAsync(relation.ChildCompositionId.Value, isConstant: false, cancellationToken);
+                }
+                else
+                {
+                    continue;
+                }
+
+                for (int m = 0; m < relation.Multiplicity; m++)
                 {
                     sb.Append(childText);
                 }
             }
+
+            return sb.ToString();
         }
 
-        return sb.ToString();
+        // If isConstant was null (auto-detect) and not found as composition, try constant
+        if (isConstant == null)
+        {
+            var constant = await _context.Constants.FindAsync(new object[] { nodeId }, cancellationToken);
+            if (constant != null)
+            {
+                if (constant.SeedType == 0) // Unicode
+                {
+                    return char.ConvertFromUtf32((int)constant.SeedValue);
+                }
+                return "";
+            }
+        }
+
+        throw new ArgumentException($"Node {nodeId} not found in Constants or Compositions");
     }
 
     /// <summary>
@@ -641,47 +757,34 @@ public class HierarchicalTextIngestionService
         int topN = 100,
         CancellationToken cancellationToken = default)
     {
-        // Count how many compositions reference each atom
-        var allCompositions = await _context.Atoms
-            .Where(a => !a.IsConstant && a.Refs != null)
-            .Select(a => new { a.Id, a.Refs, a.TypeRef })
+        // Count how many compositions reference each child composition using Relations table
+        var referenceCount = await _context.Relations
+            .Where(r => r.ChildCompositionId.HasValue)
+            .GroupBy(r => r.ChildCompositionId!.Value)
+            .Select(g => new { CompositionId = g.Key, Count = g.Count() })
+            .OrderByDescending(g => g.Count)
+            .Take(topN * 2)
             .ToListAsync(cancellationToken);
 
-        var referenceCount = new Dictionary<long, int>();
-        foreach (var comp in allCompositions)
-        {
-            if (comp.Refs != null)
-            {
-                foreach (var refId in comp.Refs.Distinct())
-                {
-                    referenceCount.TryGetValue(refId, out int count);
-                    referenceCount[refId] = count + 1;
-                }
-            }
-        }
+        // Get top N most referenced patterns (compositions only)
+        var topPatternIds = referenceCount.Select(r => r.CompositionId).ToList();
+        var patternCompositions = await _context.Compositions
+            .Where(c => topPatternIds.Contains(c.Id))
+            .ToDictionaryAsync(c => c.Id, cancellationToken);
 
-        // Get top N most referenced patterns (not constants)
-        var topPatterns = referenceCount
-            .OrderByDescending(kv => kv.Value)
-            .Take(topN * 2) // Get extra in case some are constants
-            .Select(kv => kv.Key)
-            .ToList();
-
-        var patternAtoms = await _context.Atoms
-            .Where(a => topPatterns.Contains(a.Id) && !a.IsConstant)
-            .ToDictionaryAsync(a => a.Id, cancellationToken);
+        var refCountDict = referenceCount.ToDictionary(r => r.CompositionId, r => r.Count);
 
         var results = new List<PatternUsageStats>();
-        foreach (var patternId in topPatterns.Where(id => patternAtoms.ContainsKey(id)).Take(topN))
+        foreach (var patternId in topPatternIds.Where(id => patternCompositions.ContainsKey(id)).Take(topN))
         {
-            var atom = patternAtoms[patternId];
+            var composition = patternCompositions[patternId];
             var reconstructed = await ReconstructTextAsync(patternId, cancellationToken);
             
             results.Add(new PatternUsageStats
             {
                 AtomId = patternId,
-                TypeRef = atom.TypeRef,
-                ReferenceCount = referenceCount[patternId],
+                TypeRef = composition.TypeId,
+                ReferenceCount = refCountDict[patternId],
                 ReconstructedText = reconstructed.Length > 100
                     ? reconstructed.Substring(0, 100) + "..."
                     : reconstructed
@@ -698,6 +801,12 @@ public class HierarchicalTextIngestionService
 public class HierarchicalIngestionResult
 {
     public long RootAtomId { get; set; }
+    
+    /// <summary>
+    /// True if RootAtomId refers to a Constant, false if it refers to a Composition.
+    /// </summary>
+    public bool RootIsConstant { get; set; }
+    
     public int Tier0CharacterCount { get; set; }
     public int UniqueCharacterCount { get; set; }
     public int TotalPatternsDiscovered { get; set; }

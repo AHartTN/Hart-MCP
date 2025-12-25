@@ -1,7 +1,10 @@
 using System.Text.Json;
 using Hart.MCP.Core.Data;
+using Hart.MCP.Core.Entities;
+using Hart.MCP.Core.Native;
 using Microsoft.EntityFrameworkCore;
 using Microsoft.Extensions.Logging;
+using NetTopologySuite.Geometries;
 
 namespace Hart.MCP.Core.Services.Ingestion;
 
@@ -47,22 +50,20 @@ public class JsonIngestionService : IngestionServiceBase, IIngestionService<Json
         // PHASE 2: BULK create ALL primitive constants
         // ============================================
         var charLookup = await BulkGetOrCreateConstantsAsync(
-            uniqueChars.ToArray(), SEED_TYPE_UNICODE, null, ct);
+            uniqueChars.ToArray(), SEED_TYPE_UNICODE, ct);
         
-        // For integers/floats, we use GetOrCreateIntegerConstantAsync which is still
-        // per-item, but these are typically few in number compared to char constants.
-        // A future optimization could batch these too.
+        // For integers/floats, use GetOrCreateConstantAsync from base class
         var intLookup = new Dictionary<long, long>();
         foreach (var val in uniqueInts)
         {
-            intLookup[val] = await GetOrCreateIntegerConstantAsync(val, null, ct);
+            intLookup[val] = await GetOrCreateConstantAsync(val, SEED_TYPE_INTEGER, ct);
         }
 
         var floatLookup = new Dictionary<ulong, long>();
         foreach (var bits in uniqueFloats)
         {
-            // Store as double precision bits (SEED_TYPE_FLOAT_BITS stores uint32, we need uint64 for double)
-            floatLookup[bits] = await GetOrCreateIntegerConstantAsync((long)bits, null, ct);
+            // Store as double precision bits
+            floatLookup[bits] = await GetOrCreateConstantAsync((long)bits, SEED_TYPE_FLOAT_BITS, ct);
         }
 
         // ============================================
@@ -146,9 +147,9 @@ public class JsonIngestionService : IngestionServiceBase, IIngestionService<Json
             JsonValueKind.Array => await IngestArrayAsync(element, charLookup, intLookup, floatLookup, ct),
             JsonValueKind.String => await IngestStringValueAsync(element.GetString()!, charLookup, ct),
             JsonValueKind.Number => IngestNumber(element, intLookup, floatLookup),
-            JsonValueKind.True => await GetOrCreateConstantAsync(1, SEED_TYPE_INTEGER, null, ct),
-            JsonValueKind.False => await GetOrCreateConstantAsync(0, SEED_TYPE_INTEGER, null, ct),
-            JsonValueKind.Null => await GetOrCreateConstantAsync(0xFFFFFFFF, SEED_TYPE_INTEGER, null, ct),
+            JsonValueKind.True => await GetOrCreateConstantAsync(1, SEED_TYPE_BOOLEAN, ct),
+            JsonValueKind.False => await GetOrCreateConstantAsync(0, SEED_TYPE_BOOLEAN, ct),
+            JsonValueKind.Null => await GetOrCreateConstantAsync(0, SEED_TYPE_JSON_NULL, ct),
             _ => throw new ArgumentException($"Unknown JSON value kind: {element.ValueKind}")
         };
     }
@@ -173,36 +174,38 @@ public class JsonIngestionService : IngestionServiceBase, IIngestionService<Json
         Dictionary<ulong, long> floatLookup,
         CancellationToken ct)
     {
-        var pairAtomIds = new List<long>();
+        var pairIds = new List<long>();
+        var pairIsConstant = new List<bool>();
 
         foreach (var prop in obj.EnumerateObject())
         {
-            // Ingest key as text (using lookup, no DB)
-            var keyAtomId = await IngestStringValueAsync(prop.Name, charLookup, ct);
+            // Ingest key as text (using lookup, no DB) - returns composition ID
+            var keyId = await IngestStringValueAsync(prop.Name, charLookup, ct);
             
-            // Ingest value recursively
-            var valueAtomId = await IngestElementAsync(prop.Value, charLookup, intLookup, floatLookup, ct);
+            // Ingest value recursively - can return constant or composition
+            var (valueId, valueIsConstant) = await IngestElementWithTypeAsync(prop.Value, charLookup, intLookup, floatLookup, ct);
             
-            // Create key-value pair composition
-            var pairId = await CreateCompositionAsync(
-                new[] { keyAtomId, valueAtomId },
-                new[] { 1, 1 },
-                null,
-                ct
-            );
-            pairAtomIds.Add(pairId);
+            // Create key-value pair composition (key is always a composition from string)
+            var pairChildren = new (long id, bool isConstant)[] 
+            { 
+                (keyId, false), // key string is a composition
+                (valueId, valueIsConstant) 
+            };
+            var pairId = await CreateCompositionAsync(pairChildren, new[] { 1, 1 }, null, ct);
+            pairIds.Add(pairId);
+            pairIsConstant.Add(false); // pairs are compositions
         }
 
-        if (pairAtomIds.Count == 0)
+        if (pairIds.Count == 0)
         {
-            // Empty object - special marker
-            var emptyMarker = await GetOrCreateConstantAsync(0xFFFFFFFE, SEED_TYPE_INTEGER, null, ct);
-            return emptyMarker;
+            // Empty object - special marker constant
+            return await GetOrCreateConstantAsync(0xFFFFFFFE, SEED_TYPE_INTEGER, ct);
         }
 
+        var children = pairIds.Select(id => (id, isConstant: false)).ToArray();
         return await CreateCompositionAsync(
-            pairAtomIds.ToArray(),
-            Enumerable.Repeat(1, pairAtomIds.Count).ToArray(),
+            children,
+            Enumerable.Repeat(1, pairIds.Count).ToArray(),
             null,
             ct
         );
@@ -215,24 +218,23 @@ public class JsonIngestionService : IngestionServiceBase, IIngestionService<Json
         Dictionary<ulong, long> floatLookup,
         CancellationToken ct)
     {
-        var elementAtomIds = new List<long>();
+        var elementIds = new List<(long id, bool isConstant)>();
 
         foreach (var element in arr.EnumerateArray())
         {
-            var elementId = await IngestElementAsync(element, charLookup, intLookup, floatLookup, ct);
-            elementAtomIds.Add(elementId);
+            var (elementId, isConst) = await IngestElementWithTypeAsync(element, charLookup, intLookup, floatLookup, ct);
+            elementIds.Add((elementId, isConst));
         }
 
-        if (elementAtomIds.Count == 0)
+        if (elementIds.Count == 0)
         {
-            // Empty array - special marker
-            var emptyMarker = await GetOrCreateConstantAsync(0xFFFFFFFD, SEED_TYPE_INTEGER, null, ct);
-            return emptyMarker;
+            // Empty array - special marker constant
+            return await GetOrCreateConstantAsync(0xFFFFFFFD, SEED_TYPE_INTEGER, ct);
         }
 
         return await CreateCompositionAsync(
-            elementAtomIds.ToArray(),
-            Enumerable.Repeat(1, elementAtomIds.Count).ToArray(),
+            elementIds.ToArray(),
+            Enumerable.Repeat(1, elementIds.Count).ToArray(),
             null,
             ct
         );
@@ -245,12 +247,12 @@ public class JsonIngestionService : IngestionServiceBase, IIngestionService<Json
     {
         if (string.IsNullOrEmpty(str))
         {
-            return await GetOrCreateConstantAsync(0xFFFFFFFC, SEED_TYPE_INTEGER, null, ct);
+            return await GetOrCreateConstantAsync(0xFFFFFFFC, SEED_TYPE_INTEGER, ct);
         }
 
         // RLE compress and use lookup
         var codepoints = ExtractCodepoints(str);
-        var atomIds = new List<long>();
+        var constantIds = new List<long>();
         var multiplicities = new List<int>();
 
         int i = 0;
@@ -261,103 +263,160 @@ public class JsonIngestionService : IngestionServiceBase, IIngestionService<Json
             while (i + count < codepoints.Count && codepoints[i + count] == cp)
                 count++;
 
-            atomIds.Add(charLookup[cp]); // O(1) lookup, NO DB
+            constantIds.Add(charLookup[cp]); // O(1) lookup, NO DB
             multiplicities.Add(count);
             i += count;
         }
 
-        return await CreateCompositionAsync(atomIds.ToArray(), multiplicities.ToArray(), null, ct);
+        return await CreateCompositionFromConstantsAsync(constantIds.ToArray(), multiplicities.ToArray(), null, ct);
     }
 
     public async Task<JsonElement> ReconstructAsync(long compositionId, CancellationToken ct = default)
     {
-        var atom = await Context.Atoms.FindAsync(new object[] { compositionId }, ct);
-        if (atom == null)
-            throw new InvalidOperationException($"Atom {compositionId} not found");
-
-        var jsonString = await ReconstructToStringAsync(atom, ct);
-        return JsonDocument.Parse(jsonString).RootElement;
-    }
-
-    private async Task<string> ReconstructToStringAsync(Entities.Atom atom, CancellationToken ct)
-    {
-        // Handle constants based on SeedType and SeedValue
-        if (atom.IsConstant)
+        // First try to find as a composition
+        var composition = await Context.Compositions.FindAsync(new object[] { compositionId }, ct);
+        if (composition != null)
         {
-            return atom.SeedType switch
-            {
-                SEED_TYPE_UNICODE => char.ConvertFromUtf32((int)(atom.SeedValue ?? 0)),
-                SEED_TYPE_INTEGER => atom.SeedValue switch
-                {
-                    0 => "false",              // JSON false
-                    1 => "true",               // JSON true
-                    0xFFFFFFFF => "null",      // JSON null
-                    0xFFFFFFFE => "{}",        // Empty object
-                    0xFFFFFFFD => "[]",        // Empty array
-                    0xFFFFFFFC => "\"\"",      // Empty string
-                    var v => v?.ToString() ?? "0"  // Regular integer
-                },
-                SEED_TYPE_FLOAT_BITS => BitConverter.UInt64BitsToDouble((ulong)(atom.SeedValue ?? 0)).ToString("G17"),
-                _ => throw new InvalidOperationException($"Unknown constant SeedType: {atom.SeedType}")
-            };
+            var jsonString = await ReconstructCompositionToStringAsync(compositionId, ct);
+            return JsonDocument.Parse(jsonString).RootElement;
         }
 
-        // Compositions - infer type from structure
-        if (atom.Refs == null || atom.Refs.Length == 0)
-            return "null";
-
-        // Check first ref to determine structure type
-        var firstRef = await Context.Atoms.FindAsync(new object[] { atom.Refs[0] }, ct);
-        if (firstRef == null)
-            return "null";
-
-        // Key-value pair = [key, value] where key is a string composition
-        if (atom.Refs.Length == 2 && !firstRef.IsConstant && firstRef.Refs?.Length > 0)
+        // Otherwise it might be a constant (for primitives)
+        var constant = await Context.Constants.FindAsync(new object[] { compositionId }, ct);
+        if (constant != null)
         {
-            // Could be a pair - check if first is a char composition (string key)
-            var firstOfFirst = await Context.Atoms.FindAsync(new object[] { firstRef.Refs[0] }, ct);
-            if (firstOfFirst?.IsConstant == true && firstOfFirst.SeedType == SEED_TYPE_UNICODE)
+            var jsonString = ReconstructConstantToString(constant);
+            return JsonDocument.Parse(jsonString).RootElement;
+        }
+
+        throw new InvalidOperationException($"Entity {compositionId} not found as Constant or Composition");
+    }
+
+    private string ReconstructConstantToString(Constant constant)
+    {
+        return constant.SeedType switch
+        {
+            SEED_TYPE_UNICODE => char.ConvertFromUtf32((int)constant.SeedValue),
+            SEED_TYPE_INTEGER => constant.SeedValue switch
             {
-                // This is a pair - reconstruct as object with one property
-                throw new InvalidOperationException("Cannot reconstruct pair directly");
+                0xFFFFFFFE => "{}",        // Empty object
+                0xFFFFFFFD => "[]",        // Empty array
+                0xFFFFFFFC => "\"\"",      // Empty string
+                var v => v.ToString()      // Regular integer
+            },
+            SEED_TYPE_FLOAT_BITS => BitConverter.UInt64BitsToDouble((ulong)constant.SeedValue).ToString("G17"),
+            SEED_TYPE_BOOLEAN => constant.SeedValue == 1 ? "true" : "false",
+            SEED_TYPE_JSON_NULL => "null",
+            _ => throw new InvalidOperationException($"Unknown constant SeedType: {constant.SeedType}")
+        };
+    }
+
+    private async Task<string> ReconstructCompositionToStringAsync(long compositionId, CancellationToken ct)
+    {
+        // Get relations for this composition
+        var relations = await Context.Relations
+            .Where(r => r.CompositionId == compositionId)
+            .OrderBy(r => r.Position)
+            .ToListAsync(ct);
+
+        if (relations.Count == 0)
+            return "null";
+
+        // Get first child to determine structure type
+        var firstRel = relations[0];
+        bool firstIsConstant = firstRel.ChildConstantId.HasValue;
+        long firstChildId = firstRel.ChildConstantId ?? firstRel.ChildCompositionId!.Value;
+
+        if (firstIsConstant)
+        {
+            var firstConstant = await Context.Constants.FindAsync(new object[] { firstChildId }, ct);
+            if (firstConstant?.SeedType == SEED_TYPE_UNICODE)
+            {
+                // This is a string (composition of Unicode constants)
+                return await ReconstructStringFromCompositionAsync(compositionId, ct);
+            }
+        }
+        else
+        {
+            // First child is a composition - check if it's a key-value pair (object structure)
+            // A key-value pair has exactly 2 children, where the first is a string key
+            var firstChildRelations = await Context.Relations
+                .Where(r => r.CompositionId == firstChildId)
+                .OrderBy(r => r.Position)
+                .ToListAsync(ct);
+
+            if (firstChildRelations.Count == 2)
+            {
+                // Check if the first child of this pair is a string (the key)
+                var keyRel = firstChildRelations[0];
+                if (keyRel.ChildCompositionId.HasValue)
+                {
+                    // Key is a composition - check if it's a string (Unicode chars)
+                    var keyFirstRel = await Context.Relations
+                        .Where(r => r.CompositionId == keyRel.ChildCompositionId.Value)
+                        .OrderBy(r => r.Position)
+                        .FirstOrDefaultAsync(ct);
+                    
+                    if (keyFirstRel?.ChildConstantId.HasValue == true)
+                    {
+                        var keyFirstConstant = await Context.Constants.FindAsync(
+                            new object[] { keyFirstRel.ChildConstantId.Value }, ct);
+                        if (keyFirstConstant?.SeedType == SEED_TYPE_UNICODE)
+                        {
+                            // First child is a key-value pair with string key - this is an object
+                            return await ReconstructObjectAsync(compositionId, ct);
+                        }
+                    }
+                }
             }
         }
 
-        // Array of pairs = object
-        if (!firstRef.IsConstant && firstRef.Refs?.Length == 2)
-        {
-            return await ReconstructObjectAsync(atom, ct);
-        }
-
-        // Array of char constants = string
-        if (firstRef.IsConstant && firstRef.SeedType == SEED_TYPE_UNICODE)
-        {
-            return await ReconstructStringAsync(atom, ct);
-        }
-
         // Otherwise treat as array
-        return await ReconstructArrayAsync(atom, ct);
+        return await ReconstructArrayAsync(compositionId, ct);
     }
 
-    private async Task<string> ReconstructObjectAsync(Entities.Atom obj, CancellationToken ct)
+    private async Task<string> ReconstructObjectAsync(long compositionId, CancellationToken ct)
     {
-        if (obj.Refs == null || obj.Refs.Length == 0)
+        var relations = await Context.Relations
+            .Where(r => r.CompositionId == compositionId)
+            .OrderBy(r => r.Position)
+            .ToListAsync(ct);
+
+        if (relations.Count == 0)
             return "{}";
 
         var pairs = new List<string>();
 
-        foreach (var pairId in obj.Refs)
+        foreach (var pairRel in relations)
         {
-            var pair = await Context.Atoms.FindAsync(new object[] { pairId }, ct);
-            if (pair?.Refs == null || pair.Refs.Length != 2) continue;
+            // Each relation points to a pair composition
+            if (!pairRel.ChildCompositionId.HasValue) continue;
+            var pairId = pairRel.ChildCompositionId.Value;
 
-            var keyAtom = await Context.Atoms.FindAsync(new object[] { pair.Refs[0] }, ct);
-            var valueAtom = await Context.Atoms.FindAsync(new object[] { pair.Refs[1] }, ct);
+            var pairRelations = await Context.Relations
+                .Where(r => r.CompositionId == pairId)
+                .OrderBy(r => r.Position)
+                .ToListAsync(ct);
 
-            if (keyAtom == null || valueAtom == null) continue;
+            if (pairRelations.Count != 2) continue;
 
-            var key = await ReconstructStringAsync(keyAtom, ct);
-            var value = await ReconstructToStringAsync(valueAtom, ct);
+            // First child is the key (a string composition)
+            var keyRel = pairRelations[0];
+            var keyId = keyRel.ChildCompositionId ?? keyRel.ChildConstantId!.Value;
+            var keyIsConstant = keyRel.ChildConstantId.HasValue;
+
+            // Second child is the value
+            var valueRel = pairRelations[1];
+            var valueId = valueRel.ChildCompositionId ?? valueRel.ChildConstantId!.Value;
+            var valueIsConstant = valueRel.ChildConstantId.HasValue;
+
+            var key = keyIsConstant
+                ? ReconstructConstantToString(await Context.Constants.FindAsync(new object[] { keyId }, ct) ?? throw new InvalidOperationException($"Constant {keyId} not found"))
+                : await ReconstructStringFromCompositionAsync(keyId, ct);
+            
+            var value = valueIsConstant
+                ? ReconstructConstantToString(await Context.Constants.FindAsync(new object[] { valueId }, ct) ?? throw new InvalidOperationException($"Constant {valueId} not found"))
+                : await ReconstructCompositionToStringAsync(valueId, ct);
 
             pairs.Add($"{key}:{value}");
         }
@@ -365,40 +424,59 @@ public class JsonIngestionService : IngestionServiceBase, IIngestionService<Json
         return "{" + string.Join(",", pairs) + "}";
     }
 
-    private async Task<string> ReconstructArrayAsync(Entities.Atom arr, CancellationToken ct)
+    private async Task<string> ReconstructArrayAsync(long compositionId, CancellationToken ct)
     {
-        if (arr.Refs == null || arr.Refs.Length == 0)
+        var relations = await Context.Relations
+            .Where(r => r.CompositionId == compositionId)
+            .OrderBy(r => r.Position)
+            .ToListAsync(ct);
+
+        if (relations.Count == 0)
             return "[]";
 
         var elements = new List<string>();
 
-        foreach (var elemId in arr.Refs)
+        foreach (var rel in relations)
         {
-            var elem = await Context.Atoms.FindAsync(new object[] { elemId }, ct);
-            if (elem == null) continue;
+            var childId = rel.ChildCompositionId ?? rel.ChildConstantId!.Value;
+            var isConstant = rel.ChildConstantId.HasValue;
 
-            var value = await ReconstructToStringAsync(elem, ct);
+            var value = isConstant
+                ? ReconstructConstantToString(await Context.Constants.FindAsync(new object[] { childId }, ct) ?? throw new InvalidOperationException($"Constant {childId} not found"))
+                : await ReconstructCompositionToStringAsync(childId, ct);
             elements.Add(value);
         }
 
         return "[" + string.Join(",", elements) + "]";
     }
 
-    private async Task<string> ReconstructStringAsync(Entities.Atom str, CancellationToken ct)
+    private async Task<string> ReconstructStringFromCompositionAsync(long compositionId, CancellationToken ct)
     {
-        if (str.Refs == null || str.Refs.Length == 0)
+        var relations = await Context.Relations
+            .Where(r => r.CompositionId == compositionId)
+            .OrderBy(r => r.Position)
+            .ToListAsync(ct);
+
+        if (relations.Count == 0)
             return "\"\"";
 
         var chars = new List<string>();
-        var charAtoms = await Context.Atoms
-            .Where(a => str.Refs.Contains(a.Id) && a.IsConstant)
-            .ToDictionaryAsync(a => a.Id, ct);
+        var charConstantIds = relations
+            .Where(r => r.ChildConstantId.HasValue)
+            .Select(r => r.ChildConstantId!.Value)
+            .Distinct()
+            .ToList();
+        var charConstants = await Context.Constants
+            .Where(c => charConstantIds.Contains(c.Id))
+            .ToDictionaryAsync(c => c.Id, ct);
 
-        for (int i = 0; i < str.Refs.Length; i++)
+        foreach (var rel in relations)
         {
-            var charAtom = charAtoms[str.Refs[i]];
-            var mult = str.Multiplicities?[i] ?? 1;
-            var cp = (uint)(charAtom.SeedValue ?? 0);
+            if (!rel.ChildConstantId.HasValue) continue;
+            
+            var charConstant = charConstants[rel.ChildConstantId.Value];
+            var mult = rel.Multiplicity;
+            var cp = (uint)charConstant.SeedValue;
             var c = char.ConvertFromUtf32((int)cp);
 
             for (int m = 0; m < mult; m++)
@@ -425,5 +503,105 @@ public class JsonIngestionService : IngestionServiceBase, IIngestionService<Json
             }
         }
         return codepoints;
+    }
+
+    /// <summary>
+    /// Ingest a JSON element and return both the ID and whether it's a constant.
+    /// </summary>
+    private async Task<(long id, bool isConstant)> IngestElementWithTypeAsync(
+        JsonElement element,
+        Dictionary<uint, long> charLookup,
+        Dictionary<long, long> intLookup,
+        Dictionary<ulong, long> floatLookup,
+        CancellationToken ct)
+    {
+        return element.ValueKind switch
+        {
+            // Objects and arrays become compositions
+            JsonValueKind.Object => (await IngestObjectAsync(element, charLookup, intLookup, floatLookup, ct), false),
+            JsonValueKind.Array => (await IngestArrayAsync(element, charLookup, intLookup, floatLookup, ct), false),
+            // Strings become compositions of character constants
+            JsonValueKind.String => (await IngestStringValueAsync(element.GetString()!, charLookup, ct), false),
+            // Numbers are constants (already in lookup)
+            JsonValueKind.Number => (IngestNumber(element, intLookup, floatLookup), true),
+            // Booleans are constants with SEED_TYPE_BOOLEAN
+            JsonValueKind.True => (await GetOrCreateConstantAsync(1, SEED_TYPE_BOOLEAN, ct), true),
+            JsonValueKind.False => (await GetOrCreateConstantAsync(0, SEED_TYPE_BOOLEAN, ct), true),
+            // Null is a constant with SEED_TYPE_JSON_NULL
+            JsonValueKind.Null => (await GetOrCreateConstantAsync(0, SEED_TYPE_JSON_NULL, ct), true),
+            _ => throw new ArgumentException($"Unknown JSON value kind: {element.ValueKind}")
+        };
+    }
+
+    /// <summary>
+    /// BULK get or create constants for multiple seed values.
+    /// Queries DB ONCE for all existing, batch inserts all missing.
+    /// </summary>
+    private async Task<Dictionary<uint, long>> BulkGetOrCreateConstantsAsync(
+        uint[] seedValues,
+        int seedType,
+        CancellationToken ct)
+    {
+        var result = new Dictionary<uint, long>(seedValues.Length);
+        
+        // Get unique values
+        var uniqueValues = seedValues.Distinct().ToArray();
+        
+        // Convert to long for query (SeedValue is stored as long)
+        var valuesAsLong = uniqueValues.Select(v => (long)v).ToList();
+
+        // SINGLE QUERY: Get all existing constants by seed value and seedType
+        var existing = await Context.Constants
+            .Where(c => c.SeedType == seedType && valuesAsLong.Contains(c.SeedValue))
+            .Select(c => new { c.Id, c.SeedValue })
+            .ToListAsync(ct);
+
+        // Map existing to result
+        foreach (var constant in existing)
+        {
+            var val = (uint)constant.SeedValue;
+            result[val] = constant.Id;
+        }
+
+        // Find missing values
+        var missingValues = uniqueValues.Where(v => !result.ContainsKey(v)).ToList();
+        
+        if (missingValues.Count > 0)
+        {
+            // BATCH INSERT: Create all missing constants
+            var newConstants = new List<(uint Value, Constant Constant)>();
+            
+            foreach (var val in missingValues)
+            {
+                var contentHash = NativeLibrary.ComputeSeedHash(val);
+                var point = NativeLibrary.project_seed_to_hypersphere(val);
+                var hilbert = NativeLibrary.point_to_hilbert(point);
+                var geom = GeometryFactory.CreatePoint(new CoordinateZM(point.X, point.Y, point.Z, point.M));
+
+                var constant = new Constant
+                {
+                    HilbertHigh = (ulong)hilbert.High,
+                    HilbertLow = (ulong)hilbert.Low,
+                    Geom = geom,
+                    SeedValue = val,
+                    SeedType = seedType,
+                    ContentHash = contentHash
+                };
+
+                Context.Constants.Add(constant);
+                newConstants.Add((val, constant));
+            }
+
+            // ONE SaveChanges for all new constants
+            await Context.SaveChangesAsync(ct);
+
+            // Map new constants to result
+            foreach (var (val, constant) in newConstants)
+            {
+                result[val] = constant.Id;
+            }
+        }
+
+        return result;
     }
 }
