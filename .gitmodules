@@ -1,0 +1,3 @@
+[submodule "src/Hart.MCP.Native/external/blake3"]
+	path = src/Hart.MCP.Native/external/blake3
+	url = https://github.com/BLAKE3-team/BLAKE3.git

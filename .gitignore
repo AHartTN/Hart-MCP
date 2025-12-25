@@ -416,3 +416,20 @@ FodyWeavers.xsd
 *.msix
 *.msm
 *.msp
+
+# What the AI agents originally had ignored
+build/
+bin/
+obj/
+*.user
+*.suo
+.vs/
+packages/
+*.dll
+*.pdb
+*.exe
+!external/
+node_modules/
+.DS_Store
+Thumbs.db
+*.log

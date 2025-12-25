@@ -1,0 +1,139 @@
+name: Build and Test
+
+on:
+  push:
+    branches: [ main, develop ]
+  pull_request:
+    branches: [ main ]
+
+env:
+  DOTNET_VERSION: '10.0.x'
+  BUILD_CONFIGURATION: Release
+
+jobs:
+  build-native:
+    name: Build Native Library
+    runs-on: windows-latest
+    
+    steps:
+    - uses: actions/checkout@v4
+      with:
+        submodules: recursive
+    
+    - name: Setup MSVC
+      uses: ilammy/msvc-dev-cmd@v1
+      with:
+        arch: x64
+    
+    - name: Configure CMake
+      working-directory: src/Hart.MCP.Native
+      run: |
+        mkdir -p build
+        cd build
+        cmake -G "Visual Studio 17 2022" -A x64 ..
+    
+    - name: Build Native Library
+      working-directory: src/Hart.MCP.Native/build
+      run: cmake --build . --config ${{ env.BUILD_CONFIGURATION }}
+    
+    - name: Check for Truncation Warnings
+      working-directory: src/Hart.MCP.Native/build
+      shell: pwsh
+      run: |
+        $buildLog = cmake --build . --config ${{ env.BUILD_CONFIGURATION }} 2>&1 | Out-String
+        if ($buildLog -match "C4244|truncation|conversion from.*to") {
+          Write-Host "ERROR: Truncation warnings detected - these cause data loss!"
+          exit 1
+        }
+        Write-Host "Zero truncation warnings - clean build!"
+    
+    - name: Run Native Tests - Hilbert
+      working-directory: src/Hart.MCP.Native/build
+      run: |
+        ./${{ env.BUILD_CONFIGURATION }}/test_hilbert.exe
+    
+    - name: Run Native Tests - Atom Seed
+      working-directory: src/Hart.MCP.Native/build
+      run: |
+        ./${{ env.BUILD_CONFIGURATION }}/test_atom_seed.exe
+    
+    - name: Upload Native Library
+      uses: actions/upload-artifact@v4
+      with:
+        name: native-library
+        path: src/Hart.MCP.Native/build/${{ env.BUILD_CONFIGURATION }}/hartonomous_native.dll
+        retention-days: 7
+
+  build-dotnet:
+    name: Build .NET Solution
+    needs: build-native
+    runs-on: windows-latest
+    
+    steps:
+    - uses: actions/checkout@v4
+    
+    - name: Setup .NET
+      uses: actions/setup-dotnet@v4
+      with:
+        dotnet-version: ${{ env.DOTNET_VERSION }}
+    
+    - name: Download Native Library
+      uses: actions/download-artifact@v4
+      with:
+        name: native-library
+        path: src/Hart.MCP.Native/lib
+    
+    - name: Restore dependencies
+      run: dotnet restore Hart.MCP.sln
+    
+    - name: Build
+      run: dotnet build Hart.MCP.sln --configuration ${{ env.BUILD_CONFIGURATION }} --no-restore
+    
+    - name: Run .NET Tests
+      run: dotnet test src/Hart.MCP.Tests/Hart.MCP.Tests.csproj --configuration ${{ env.BUILD_CONFIGURATION }} --no-build --verbosity normal --logger trx --results-directory TestResults
+    
+    - name: Upload Test Results
+      uses: actions/upload-artifact@v4
+      if: always()
+      with:
+        name: test-results
+        path: TestResults/*.trx
+        retention-days: 7
+
+  security-scan:
+    name: Security Scan
+    runs-on: ubuntu-latest
+    needs: build-dotnet
+    
+    steps:
+    - uses: actions/checkout@v4
+    
+    - name: Setup .NET
+      uses: actions/setup-dotnet@v4
+      with:
+        dotnet-version: ${{ env.DOTNET_VERSION }}
+    
+    - name: Restore dependencies
+      run: dotnet restore Hart.MCP.sln
+    
+    - name: Run Security Audit
+      run: dotnet list package --vulnerable --include-transitive
+
+  code-quality:
+    name: Code Quality
+    runs-on: ubuntu-latest
+    
+    steps:
+    - uses: actions/checkout@v4
+    
+    - name: Setup .NET
+      uses: actions/setup-dotnet@v4
+      with:
+        dotnet-version: ${{ env.DOTNET_VERSION }}
+    
+    - name: Restore dependencies
+      run: dotnet restore Hart.MCP.sln
+    
+    - name: Run Format Check
+      run: dotnet format Hart.MCP.sln --verify-no-changes --verbosity diagnostic
+      continue-on-error: true

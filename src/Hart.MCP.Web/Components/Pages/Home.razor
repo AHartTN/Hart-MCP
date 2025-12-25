@@ -1,0 +1,121 @@
+﻿@page "/"
+@using Hart.MCP.Web.Services
+@inject HartApiClient ApiClient
+
+<PageTitle>Hart.MCP - Spatial Knowledge Substrate</PageTitle>
+
+<div class="container">
+    <div class="header">
+        <h1>🧠 Hart.MCP</h1>
+        <p class="subtitle">Spatial Knowledge Substrate</p>
+    </div>
+
+    <div class="status-card">
+        <h2>System Status</h2>
+        @if (_isLoading)
+        {
+            <p class="loading">Connecting to API...</p>
+        }
+        else if (_isHealthy)
+        {
+            <p class="status-healthy">✅ API Connected</p>
+            @if (_stats != null)
+            {
+                <div class="stats-grid">
+                    <div class="stat-item">
+                        <span class="stat-label">Total Atoms</span>
+                        <span class="stat-value">@_stats.TotalAtoms.ToString("N0")</span>
+                    </div>
+                    <div class="stat-item">
+                        <span class="stat-label">Constants</span>
+                        <span class="stat-value">@_stats.TotalConstants.ToString("N0")</span>
+                    </div>
+                    <div class="stat-item">
+                        <span class="stat-label">Compositions</span>
+                        <span class="stat-value">@_stats.TotalCompositions.ToString("N0")</span>
+                    </div>
+                    <div class="stat-item">
+                        <span class="stat-label">Database Size</span>
+                        <span class="stat-value">@FormatBytes(_stats.DatabaseSizeBytes)</span>
+                    </div>
+                </div>
+            }
+        }
+        else
+        {
+            <p class="status-error">❌ API Unavailable</p>
+            <p class="error-hint">Ensure Hart.MCP.Api is running</p>
+        }
+    </div>
+
+    <div class="features">
+        <div class="feature-card">
+            <h3>📥 Ingest</h3>
+            <p>Convert text, embeddings, and AI models into spatial atoms</p>
+        </div>
+        <div class="feature-card">
+            <h3>🔍 Query</h3>
+            <p>Spatial nearest-neighbor queries on the 4D hypersphere</p>
+        </div>
+        <div class="feature-card">
+            <h3>🎨 Visualize</h3>
+            <p>Explore the knowledge substrate in 3D</p>
+        </div>
+    </div>
+</div>
+
+<style>
+    .container { max-width: 1200px; margin: 0 auto; padding: 2rem; }
+    .header { text-align: center; margin-bottom: 2rem; }
+    .header h1 { font-size: 3rem; margin-bottom: 0.5rem; }
+    .subtitle { color: #666; font-size: 1.2rem; }
+    .status-card { background: #f8f9fa; border-radius: 12px; padding: 2rem; margin-bottom: 2rem; }
+    .status-card h2 { margin-top: 0; }
+    .loading { color: #666; }
+    .status-healthy { color: #28a745; font-weight: bold; }
+    .status-error { color: #dc3545; font-weight: bold; }
+    .error-hint { color: #666; font-size: 0.9rem; }
+    .stats-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(150px, 1fr)); gap: 1rem; margin-top: 1rem; }
+    .stat-item { background: white; padding: 1rem; border-radius: 8px; text-align: center; }
+    .stat-label { display: block; color: #666; font-size: 0.9rem; }
+    .stat-value { display: block; font-size: 1.5rem; font-weight: bold; color: #333; }
+    .features { display: grid; grid-template-columns: repeat(auto-fit, minmax(250px, 1fr)); gap: 1.5rem; }
+    .feature-card { background: white; border: 1px solid #e9ecef; border-radius: 12px; padding: 1.5rem; }
+    .feature-card h3 { margin-top: 0; }
+    .feature-card p { color: #666; margin-bottom: 0; }
+</style>
+
+@code {
+    private bool _isLoading = true;
+    private bool _isHealthy;
+    private Hart.MCP.Shared.Models.SystemStats? _stats;
+
+    protected override async Task OnInitializedAsync()
+    {
+        _isHealthy = await ApiClient.HealthCheckAsync();
+        
+        if (_isHealthy)
+        {
+            var statsResponse = await ApiClient.GetSystemStatsAsync();
+            if (statsResponse.Success && statsResponse.Data is not null)
+            {
+                _stats = statsResponse.Data;
+            }
+        }
+        
+        _isLoading = false;
+    }
+
+    private static string FormatBytes(long bytes)
+    {
+        string[] sizes = ["B", "KB", "MB", "GB", "TB"];
+        int order = 0;
+        double size = bytes;
+        while (size >= 1024 && order < sizes.Length - 1)
+        {
+            order++;
+            size /= 1024;
+        }
+        return $"{size:0.##} {sizes[order]}";
+    }
+}
