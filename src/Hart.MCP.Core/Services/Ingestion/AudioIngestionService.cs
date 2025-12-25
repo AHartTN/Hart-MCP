@@ -44,9 +44,9 @@ public class AudioIngestionService : IngestionServiceBase, IIngestionService<Aud
         // PHASE 2: BULK create ALL sample constants (ONE DB round-trip)
         // ============================================
         var sampleLookup = await BulkGetOrCreateConstantsAsync(
-            uniqueEncoded, 
-            SEED_TYPE_INTEGER, 
-            "audio_sample", 
+            uniqueEncoded,
+            SEED_TYPE_INTEGER,
+            null,
             ct);
 
         // ============================================
@@ -76,7 +76,7 @@ public class AudioIngestionService : IngestionServiceBase, IIngestionService<Aud
             }
 
             // Create frame composition
-            var frameId = await CreateCompositionAsync(sampleAtomIds, mults, "audio_frame", ct);
+            var frameId = await CreateCompositionAsync(sampleAtomIds, mults, null, ct);
             frameAtomIds.Add(frameId);
         }
 
@@ -86,19 +86,19 @@ public class AudioIngestionService : IngestionServiceBase, IIngestionService<Aud
         var trackId = await CreateCompositionAsync(
             frameAtomIds.ToArray(),
             Enumerable.Repeat(1, frameAtomIds.Count).ToArray(),
-            "audio_track",
+            null,
             ct
         );
 
-        // Store metadata
-        var sampleRateAtom = await GetOrCreateConstantAsync((uint)audio.SampleRate, SEED_TYPE_INTEGER, "audio_meta", ct);
-        var channelsAtom = await GetOrCreateConstantAsync((uint)audio.Channels, SEED_TYPE_INTEGER, "audio_meta", ct);
-        var bitsAtom = await GetOrCreateConstantAsync((uint)audio.BitsPerSample, SEED_TYPE_INTEGER, "audio_meta", ct);
+        // Store metadata as composition: [track, sampleRate, channels, bitsPerSample]
+        var sampleRateAtom = await GetOrCreateConstantAsync((uint)audio.SampleRate, SEED_TYPE_INTEGER, null, ct);
+        var channelsAtom = await GetOrCreateConstantAsync((uint)audio.Channels, SEED_TYPE_INTEGER, null, ct);
+        var bitsAtom = await GetOrCreateConstantAsync((uint)audio.BitsPerSample, SEED_TYPE_INTEGER, null, ct);
 
         var metaId = await CreateCompositionAsync(
             new[] { trackId, sampleRateAtom, channelsAtom, bitsAtom },
             new[] { 1, 1, 1, 1 },
-            "audio",
+            null,
             ct
         );
 
@@ -108,8 +108,7 @@ public class AudioIngestionService : IngestionServiceBase, IIngestionService<Aud
 
     public async Task<AudioData> ReconstructAsync(long compositionId, CancellationToken ct = default)
     {
-        var meta = await Context.Atoms
-            .FirstOrDefaultAsync(a => a.Id == compositionId && a.AtomType == "audio", ct);
+        var meta = await Context.Atoms.FindAsync(new object[] { compositionId }, ct);
 
         if (meta?.Refs == null || meta.Refs.Length != 4)
             throw new InvalidOperationException($"Invalid audio meta atom {compositionId}");
@@ -123,8 +122,7 @@ public class AudioIngestionService : IngestionServiceBase, IIngestionService<Aud
         var channels = (int)(metaAtoms.First(a => a.Id == meta.Refs[2]).SeedValue ?? 1);
         var bitsPerSample = (int)(metaAtoms.First(a => a.Id == meta.Refs[3]).SeedValue ?? 16);
 
-        var trackAtom = await Context.Atoms
-            .FirstOrDefaultAsync(a => a.Id == trackAtomId && a.AtomType == "audio_track", ct);
+        var trackAtom = await Context.Atoms.FindAsync(new object[] { trackAtomId }, ct);
 
         if (trackAtom?.Refs == null)
             throw new InvalidOperationException("Invalid audio track atom");
@@ -133,8 +131,7 @@ public class AudioIngestionService : IngestionServiceBase, IIngestionService<Aud
 
         foreach (var frameId in trackAtom.Refs)
         {
-            var frameAtom = await Context.Atoms
-                .FirstOrDefaultAsync(a => a.Id == frameId && a.AtomType == "audio_frame", ct);
+            var frameAtom = await Context.Atoms.FindAsync(new object[] { frameId }, ct);
 
             if (frameAtom?.Refs == null) continue;
 
@@ -146,7 +143,7 @@ public class AudioIngestionService : IngestionServiceBase, IIngestionService<Aud
             {
                 var sampleAtom = sampleConstants[frameAtom.Refs[i]];
                 var mult = frameAtom.Multiplicities?[i] ?? 1;
-                
+
                 // Decode back to signed 16-bit
                 uint encoded = (uint)(sampleAtom.SeedValue ?? 32768);
                 short sample = (short)(encoded - 32768);

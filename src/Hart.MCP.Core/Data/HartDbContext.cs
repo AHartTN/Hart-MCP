@@ -64,13 +64,11 @@ public class HartDbContext : DbContext
                 .HasMaxLength(32)
                 .IsRequired();
 
-            entity.Property(e => e.AtomType)
-                .HasColumnName("atom_type")
-                .HasMaxLength(64);
+            entity.Property(e => e.TypeRef)
+                .HasColumnName("type_ref");
 
-            entity.Property(e => e.Metadata)
-                .HasColumnName("metadata")
-                .HasColumnType("jsonb");
+            entity.Property(e => e.Descriptors)
+                .HasColumnName("descriptors");
 
             entity.Property(e => e.CreatedAt)
                 .HasColumnName("created_at")
@@ -88,14 +86,14 @@ public class HartDbContext : DbContext
 
             entity.HasIndex(e => e.IsConstant);
 
-            entity.HasIndex(e => e.AtomType);
+            entity.HasIndex(e => e.TypeRef);
 
             entity.HasIndex(e => e.SeedValue);
 
             entity.HasIndex(e => e.CreatedAt);
 
-            // GIN index for JSONB metadata queries
-            entity.HasIndex(e => e.Metadata)
+            // GIN index for descriptors array containment queries
+            entity.HasIndex(e => e.Descriptors)
                 .HasMethod("GIN");
 
             // GIN index for refs array containment queries
@@ -110,8 +108,8 @@ public class HartDbContext : DbContext
     /// </summary>
     public async Task SeedUnicodeAsync(string connectionString, bool fullUnicode = true)
     {
-        // Check if already seeded
-        var hasUnicode = await Atoms.AnyAsync(a => a.AtomType == "unicode");
+        // Check if already seeded - look for character constants
+        var hasUnicode = await Atoms.AnyAsync(a => a.IsConstant && a.SeedType == 0);
         if (hasUnicode)
             return;
 

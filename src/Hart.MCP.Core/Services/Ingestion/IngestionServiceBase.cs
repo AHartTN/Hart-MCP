@@ -32,13 +32,13 @@ public abstract class IngestionServiceBase
     }
 
     /// <summary>
-    /// Compute content hash that includes both seed hash and atom type.
-    /// This ensures semantic differentiation (e.g., 1 as bool vs 1 as int).
+    /// Compute content hash that includes seed hash and seed type.
+    /// SeedType ensures semantic differentiation (codepoint vs integer vs float).
     /// </summary>
-    protected static byte[] ComputeTypedContentHash(byte[] seedHash, string atomType)
+    protected static byte[] ComputeTypedContentHash(byte[] seedHash, int seedType)
     {
         using var sha256 = SHA256.Create();
-        var typeBytes = Encoding.UTF8.GetBytes(atomType);
+        var typeBytes = BitConverter.GetBytes(seedType);
         var combined = new byte[seedHash.Length + typeBytes.Length];
         seedHash.CopyTo(combined, 0);
         typeBytes.CopyTo(combined, seedHash.Length);
@@ -48,18 +48,18 @@ public abstract class IngestionServiceBase
     /// <summary>
     /// Get or create a constant atom for a seed value.
     /// Automatically deduplicates via content hash.
-    /// Content hash includes atomType because same value can have different semantics
-    /// (e.g., 1 as json_bool means "true", 1 as json_int means number 1)
+    /// Content hash includes seedType for semantic differentiation
+    /// (codepoint vs integer vs float bits).
     /// </summary>
     protected async Task<long> GetOrCreateConstantAsync(
         uint seedValue,
         int seedType,
-        string atomType,
+        long? typeRef = null,
         CancellationToken ct = default)
     {
-        // Content hash includes atom type for semantic differentiation
+        // Content hash uses seedType for semantic differentiation
         var baseHash = NativeLibrary.ComputeSeedHash(seedValue);
-        var contentHash = ComputeTypedContentHash(baseHash, atomType);
+        var contentHash = ComputeTypedContentHash(baseHash, seedType);
 
         var existing = await Context.Atoms
             .Where(a => a.ContentHash == contentHash && a.IsConstant)
@@ -83,7 +83,7 @@ public abstract class IngestionServiceBase
             Refs = null,
             Multiplicities = null,
             ContentHash = contentHash,
-            AtomType = atomType
+            TypeRef = typeRef
         };
 
         Context.Atoms.Add(atom);
@@ -112,13 +112,13 @@ public abstract class IngestionServiceBase
     /// </summary>
     protected async Task<long> GetOrCreateIntegerConstantAsync(
         long value,
-        string atomType,
+        long? typeRef = null,
         CancellationToken ct = default)
     {
         // Use the low 32 bits as seed, store full value in SeedValue
         uint seedLow = (uint)(value & 0xFFFFFFFF);
         var baseHash = NativeLibrary.ComputeSeedHash(seedLow);
-        
+
         // For full 64-bit, we need to incorporate high bits into hash
         var highSeed = (uint)((value >> 32) & 0xFFFFFFFF);
         if (highSeed != 0 && value >= 0 || value < 0)
@@ -130,8 +130,8 @@ public abstract class IngestionServiceBase
             );
         }
 
-        // Include atom type in content hash for semantic differentiation
-        var contentHash = ComputeTypedContentHash(baseHash, atomType);
+        // Use seedType for content hash differentiation
+        var contentHash = ComputeTypedContentHash(baseHash, SEED_TYPE_INTEGER);
 
         var existing = await Context.Atoms
             .Where(a => a.ContentHash == contentHash && a.IsConstant)
@@ -155,7 +155,7 @@ public abstract class IngestionServiceBase
             Refs = null,
             Multiplicities = null,
             ContentHash = contentHash,
-            AtomType = atomType
+            TypeRef = typeRef
         };
 
         Context.Atoms.Add(atom);
@@ -185,7 +185,7 @@ public abstract class IngestionServiceBase
     protected async Task<long> CreateCompositionAsync(
         long[] refs,
         int[] multiplicities,
-        string atomType,
+        long? typeRef = null,
         CancellationToken ct = default)
     {
         if (refs == null || refs.Length == 0)
@@ -238,7 +238,7 @@ public abstract class IngestionServiceBase
             Refs = refs,
             Multiplicities = multiplicities,
             ContentHash = contentHash,
-            AtomType = atomType
+            TypeRef = typeRef
         };
 
         Context.Atoms.Add(composition);
@@ -262,28 +262,27 @@ public abstract class IngestionServiceBase
     }
 
     /// <summary>
-    /// BULK get or create constants - queries DB ONCE for all existing, 
+    /// BULK get or create constants - queries DB ONCE for all existing,
     /// then batch inserts all missing in ONE transaction.
     /// Returns dictionary mapping seed value to atom ID.
     /// </summary>
     protected async Task<Dictionary<uint, long>> BulkGetOrCreateConstantsAsync(
         uint[] seedValues,
         int seedType,
-        string atomType,
+        long? typeRef = null,
         CancellationToken ct = default)
     {
         var result = new Dictionary<uint, long>(seedValues.Length);
-        
+
         // Get unique seeds
         var uniqueSeeds = seedValues.Distinct().ToArray();
-        
+
         // Convert to long array for query (SeedValue is stored as long?)
         var seedsAsLong = uniqueSeeds.Select(s => (long)s).ToList();
 
-        // SINGLE QUERY: Get all existing constants by seed value and type
-        // Using SeedValue instead of ContentHash avoids byte[] comparison issues
+        // SINGLE QUERY: Get all existing constants by seed value and seedType
         var existing = await Context.Atoms
-            .Where(a => a.IsConstant && a.AtomType == atomType && a.SeedValue.HasValue && seedsAsLong.Contains(a.SeedValue.Value))
+            .Where(a => a.IsConstant && a.SeedType == seedType && a.SeedValue.HasValue && seedsAsLong.Contains(a.SeedValue.Value))
             .Select(a => new { a.Id, a.SeedValue })
             .ToListAsync(ct);
 
@@ -299,16 +298,16 @@ public abstract class IngestionServiceBase
 
         // Find missing seeds
         var missingSeeds = uniqueSeeds.Where(s => !result.ContainsKey(s)).ToList();
-        
+
         if (missingSeeds.Count > 0)
         {
             // BATCH INSERT: Create all missing atoms
             var newAtoms = new List<(uint Seed, Atom Atom)>();
-            
+
             foreach (var seed in missingSeeds)
             {
                 var baseHash = NativeLibrary.ComputeSeedHash(seed);
-                var hash = ComputeTypedContentHash(baseHash, atomType);
+                var hash = ComputeTypedContentHash(baseHash, seedType);
                 var point = NativeLibrary.project_seed_to_hypersphere(seed);
                 var hilbert = NativeLibrary.point_to_hilbert(point);
                 var geom = GeometryFactory.CreatePoint(new CoordinateZM(point.X, point.Y, point.Z, point.M));
@@ -322,7 +321,7 @@ public abstract class IngestionServiceBase
                     SeedValue = seed,
                     SeedType = seedType,
                     ContentHash = hash,
-                    AtomType = atomType
+                    TypeRef = typeRef
                 };
 
                 Context.Atoms.Add(atom);
@@ -349,11 +348,11 @@ public abstract class IngestionServiceBase
     protected async Task<long[]> BatchGetOrCreateConstantsAsync(
         uint[] seedValues,
         int seedType,
-        string atomType,
+        long? typeRef = null,
         CancellationToken ct = default)
     {
         // Use the bulk method and map back to array
-        var dict = await BulkGetOrCreateConstantsAsync(seedValues, seedType, atomType, ct);
+        var dict = await BulkGetOrCreateConstantsAsync(seedValues, seedType, typeRef, ct);
         var results = new long[seedValues.Length];
         for (int i = 0; i < seedValues.Length; i++)
         {

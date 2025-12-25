@@ -443,7 +443,7 @@ public class HierarchicalTextIngestionService
             Refs = refs,
             Multiplicities = multiplicities,
             ContentHash = contentHash,
-            AtomType = atomType
+            TypeRef = null // Type determined by structure
         };
 
         _context.Atoms.Add(atom);
@@ -464,7 +464,7 @@ public class HierarchicalTextIngestionService
 
         // Single query for existing
         var existing = await _context.Atoms
-            .Where(a => a.IsConstant && a.AtomType == "char" && 
+            .Where(a => a.IsConstant && a.SeedType == 0 && // SEED_TYPE_UNICODE
                        a.SeedValue.HasValue && codepointsAsLong.Contains(a.SeedValue.Value))
             .Select(a => new { a.Id, a.SeedValue })
             .ToListAsync(cancellationToken);
@@ -497,7 +497,7 @@ public class HierarchicalTextIngestionService
                     SeedValue = cp,
                     SeedType = 0, // Unicode
                     ContentHash = contentHash,
-                    AtomType = "char"
+                    TypeRef = null // Character constant - type determined by SeedType
                 };
 
                 _context.Atoms.Add(atom);
@@ -508,7 +508,7 @@ public class HierarchicalTextIngestionService
 
             // Re-query to get assigned IDs
             var newlyCreated = await _context.Atoms
-                .Where(a => a.IsConstant && a.AtomType == "char" &&
+                .Where(a => a.IsConstant && a.SeedType == 0 && // SEED_TYPE_UNICODE
                            a.SeedValue.HasValue && missing.Select(m => (long)m).Contains(a.SeedValue.Value))
                 .Select(a => new { a.Id, a.SeedValue })
                 .ToListAsync(cancellationToken);
@@ -644,7 +644,7 @@ public class HierarchicalTextIngestionService
         // Count how many compositions reference each atom
         var allCompositions = await _context.Atoms
             .Where(a => !a.IsConstant && a.Refs != null)
-            .Select(a => new { a.Id, a.Refs, a.AtomType })
+            .Select(a => new { a.Id, a.Refs, a.TypeRef })
             .ToListAsync(cancellationToken);
 
         var referenceCount = new Dictionary<long, int>();
@@ -680,10 +680,10 @@ public class HierarchicalTextIngestionService
             results.Add(new PatternUsageStats
             {
                 AtomId = patternId,
-                AtomType = atom.AtomType ?? "pattern",
+                TypeRef = atom.TypeRef,
                 ReferenceCount = referenceCount[patternId],
-                ReconstructedText = reconstructed.Length > 100 
-                    ? reconstructed.Substring(0, 100) + "..." 
+                ReconstructedText = reconstructed.Length > 100
+                    ? reconstructed.Substring(0, 100) + "..."
                     : reconstructed
             });
         }
@@ -718,7 +718,7 @@ public class HierarchicalIngestionResult
 public class PatternUsageStats
 {
     public long AtomId { get; set; }
-    public string AtomType { get; set; } = "";
+    public long? TypeRef { get; set; }
     public int ReferenceCount { get; set; }
     public string ReconstructedText { get; set; } = "";
 }

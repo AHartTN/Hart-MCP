@@ -90,7 +90,7 @@ public class AtomIngestionService
         var compositionId = await CreateCompositionAsync(
             atomIds.ToArray(),
             multiplicities.ToArray(),
-            "text",
+            null, // typeRef - can be set by caller if needed
             cancellationToken
         );
 
@@ -116,10 +116,10 @@ public class AtomIngestionService
         // Convert to long for query (SeedValue is stored as long?)
         var codepointsAsLong = uniqueCodepoints.Select(cp => (long)cp).ToList();
 
-        // SINGLE QUERY: Get all existing constants by seed value and type
+        // SINGLE QUERY: Get all existing constants by seed value and seedType
         // Using SeedValue instead of ContentHash avoids byte[] comparison issues in InMemory provider
         var existing = await _context.Atoms
-            .Where(a => a.IsConstant && a.AtomType == "char" && a.SeedValue.HasValue && codepointsAsLong.Contains(a.SeedValue.Value))
+            .Where(a => a.IsConstant && a.SeedType == SEED_TYPE_UNICODE && a.SeedValue.HasValue && codepointsAsLong.Contains(a.SeedValue.Value))
             .Select(a => new { a.Id, a.SeedValue })
             .ToListAsync(cancellationToken);
 
@@ -157,7 +157,7 @@ public class AtomIngestionService
                     SeedValue = cp,
                     SeedType = SEED_TYPE_UNICODE,
                     ContentHash = contentHash,
-                    AtomType = "char"
+                    TypeRef = null // Character constants - type determined by SeedType
                 };
 
                 _context.Atoms.Add(atom);
@@ -245,7 +245,7 @@ public class AtomIngestionService
             Refs = null,
             Multiplicities = null,
             ContentHash = contentHash,
-            AtomType = "char"
+            TypeRef = null // Character constants - type determined by SeedType
         };
 
         _context.Atoms.Add(atom);
@@ -277,9 +277,9 @@ public class AtomIngestionService
     /// Create a composition atom from child atom IDs
     /// </summary>
     public async Task<long> CreateCompositionAsync(
-        long[] refs, 
+        long[] refs,
         int[] multiplicities,
-        string atomType = "composition",
+        long? typeRef = null,
         CancellationToken cancellationToken = default)
     {
         if (refs == null || refs.Length == 0)
@@ -347,7 +347,7 @@ public class AtomIngestionService
             Refs = refs,
             Multiplicities = multiplicities,
             ContentHash = contentHash,
-            AtomType = atomType
+            TypeRef = typeRef
         };
 
         _context.Atoms.Add(composition);

@@ -40,9 +40,9 @@ public class ImageIngestionService : IngestionServiceBase, IIngestionService<Ima
         // PHASE 2: BULK create ALL pixel constants (ONE DB round-trip)
         // ============================================
         var pixelLookup = await BulkGetOrCreateConstantsAsync(
-            uniquePixels.ToArray(), 
-            SEED_TYPE_INTEGER, 
-            "pixel", 
+            uniquePixels.ToArray(),
+            SEED_TYPE_INTEGER,
+            null,
             ct);
 
         // ============================================
@@ -66,7 +66,7 @@ public class ImageIngestionService : IngestionServiceBase, IIngestionService<Ima
             }
 
             // Create row composition
-            rowAtomIds[y] = await CreateCompositionAsync(pixelAtomIds, mults, "image_row", ct);
+            rowAtomIds[y] = await CreateCompositionAsync(pixelAtomIds, mults, null, ct);
         }
 
         // ============================================
@@ -75,17 +75,17 @@ public class ImageIngestionService : IngestionServiceBase, IIngestionService<Ima
         var imageId = await CreateCompositionAsync(
             rowAtomIds,
             Enumerable.Repeat(1, rowAtomIds.Length).ToArray(),
-            "image",
+            null,
             ct
         );
 
-        // Store dimensions as metadata composition
-        var widthAtom = await GetOrCreateConstantAsync((uint)image.Width, SEED_TYPE_INTEGER, "dimension", ct);
-        var heightAtom = await GetOrCreateConstantAsync((uint)image.Height, SEED_TYPE_INTEGER, "dimension", ct);
+        // Store dimensions as metadata composition: [image, width, height]
+        var widthAtom = await GetOrCreateConstantAsync((uint)image.Width, SEED_TYPE_INTEGER, null, ct);
+        var heightAtom = await GetOrCreateConstantAsync((uint)image.Height, SEED_TYPE_INTEGER, null, ct);
         var metaId = await CreateCompositionAsync(
             new[] { imageId, widthAtom, heightAtom },
             new[] { 1, 1, 1 },
-            "image_meta",
+            null,
             ct
         );
 
@@ -95,8 +95,7 @@ public class ImageIngestionService : IngestionServiceBase, IIngestionService<Ima
 
     public async Task<ImageData> ReconstructAsync(long compositionId, CancellationToken ct = default)
     {
-        var meta = await Context.Atoms
-            .FirstOrDefaultAsync(a => a.Id == compositionId && a.AtomType == "image_meta", ct);
+        var meta = await Context.Atoms.FindAsync(new object[] { compositionId }, ct);
 
         if (meta?.Refs == null || meta.Refs.Length != 3)
             throw new InvalidOperationException($"Invalid image meta atom {compositionId}");
@@ -112,8 +111,7 @@ public class ImageIngestionService : IngestionServiceBase, IIngestionService<Ima
         var width = (int)(dims.First(d => d.Id == widthAtomId).SeedValue ?? 0);
         var height = (int)(dims.First(d => d.Id == heightAtomId).SeedValue ?? 0);
 
-        var imageAtom = await Context.Atoms
-            .FirstOrDefaultAsync(a => a.Id == imageAtomId && a.AtomType == "image", ct);
+        var imageAtom = await Context.Atoms.FindAsync(new object[] { imageAtomId }, ct);
 
         if (imageAtom?.Refs == null)
             throw new InvalidOperationException("Invalid image atom");

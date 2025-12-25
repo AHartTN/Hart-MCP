@@ -28,17 +28,18 @@ public class BinaryIngestionService : IngestionServiceBase, IIngestionService<by
 
         Logger?.LogInformation("Ingesting binary data: {Length} bytes", data.Length);
 
-        // Empty data is valid - return empty binary constant marker
+        // Empty data is valid - return composition with 0 refs
         if (data.Length == 0)
         {
-            return await GetOrCreateConstantAsync(0xFFFFFFFB, SEED_TYPE_INTEGER, "binary_empty", ct);
+            var lengthAtom = await GetOrCreateIntegerConstantAsync(0, null, ct);
+            return await CreateCompositionAsync(new[] { lengthAtom }, new[] { 1 }, null, ct);
         }
 
         // ============================================
         // PHASE 1: BULK create all 256 byte constants (ONE DB round-trip)
         // ============================================
         var allBytes = Enumerable.Range(0, 256).Select(b => (uint)b).ToArray();
-        var byteLookup = await BulkGetOrCreateConstantsAsync(allBytes, SEED_TYPE_INTEGER, "byte", ct);
+        var byteLookup = await BulkGetOrCreateConstantsAsync(allBytes, SEED_TYPE_INTEGER, null, ct);
 
         // ============================================
         // PHASE 2: Build chunk compositions (using lookup, minimal DB ops)
@@ -64,7 +65,7 @@ public class BinaryIngestionService : IngestionServiceBase, IIngestionService<by
                 byteAtomIds[i] = byteLookup[refs[i]];
             }
 
-            var chunkId = await CreateCompositionAsync(byteAtomIds, mults, "binary_chunk", ct);
+            var chunkId = await CreateCompositionAsync(byteAtomIds, mults, null, ct);
             chunkAtomIds.Add(chunkId);
         }
 
@@ -74,16 +75,16 @@ public class BinaryIngestionService : IngestionServiceBase, IIngestionService<by
         var binaryId = await CreateCompositionAsync(
             chunkAtomIds.ToArray(),
             Enumerable.Repeat(1, chunkAtomIds.Count).ToArray(),
-            "binary",
+            null,
             ct
         );
 
-        // Store length as metadata
-        var lengthAtom = await GetOrCreateIntegerConstantAsync(data.Length, "binary_meta", ct);
+        // Store length as composition: [binary, length]
+        var lengthAtom = await GetOrCreateIntegerConstantAsync(data.Length, null, ct);
         var metaId = await CreateCompositionAsync(
             new[] { binaryId, lengthAtom },
             new[] { 1, 1 },
-            "binary_meta",
+            null,
             ct
         );
 
@@ -93,24 +94,27 @@ public class BinaryIngestionService : IngestionServiceBase, IIngestionService<by
 
     public async Task<byte[]> ReconstructAsync(long compositionId, CancellationToken ct = default)
     {
-        // Handle empty binary constant
-        var emptyCheck = await Context.Atoms
-            .FirstOrDefaultAsync(a => a.Id == compositionId && a.AtomType == "binary_empty" && a.IsConstant, ct);
-        if (emptyCheck != null)
-            return Array.Empty<byte>();
+        var meta = await Context.Atoms.FindAsync(new object[] { compositionId }, ct);
 
-        var meta = await Context.Atoms
-            .FirstOrDefaultAsync(a => a.Id == compositionId && a.AtomType == "binary_meta", ct);
+        if (meta?.Refs == null || meta.Refs.Length < 1)
+            throw new InvalidOperationException($"Invalid binary meta atom {compositionId}");
 
-        if (meta?.Refs == null || meta.Refs.Length != 2)
+        // Check for empty binary (only has length constant)
+        if (meta.Refs.Length == 1)
+        {
+            var lengthCheck = await Context.Atoms.FindAsync(new object[] { meta.Refs[0] }, ct);
+            if (lengthCheck?.IsConstant == true && lengthCheck.SeedValue == 0)
+                return Array.Empty<byte>();
+        }
+
+        if (meta.Refs.Length != 2)
             throw new InvalidOperationException($"Invalid binary meta atom {compositionId}");
 
         var binaryAtomId = meta.Refs[0];
         var lengthAtom = await Context.Atoms.FindAsync(new object[] { meta.Refs[1] }, ct);
         var expectedLength = (int)(lengthAtom?.SeedValue ?? 0);
 
-        var binaryAtom = await Context.Atoms
-            .FirstOrDefaultAsync(a => a.Id == binaryAtomId && a.AtomType == "binary", ct);
+        var binaryAtom = await Context.Atoms.FindAsync(new object[] { binaryAtomId }, ct);
 
         if (binaryAtom?.Refs == null)
             throw new InvalidOperationException("Invalid binary atom");
@@ -119,8 +123,7 @@ public class BinaryIngestionService : IngestionServiceBase, IIngestionService<by
 
         foreach (var chunkId in binaryAtom.Refs)
         {
-            var chunkAtom = await Context.Atoms
-                .FirstOrDefaultAsync(a => a.Id == chunkId && a.AtomType == "binary_chunk", ct);
+            var chunkAtom = await Context.Atoms.FindAsync(new object[] { chunkId }, ct);
 
             if (chunkAtom?.Refs == null) continue;
 

@@ -53,9 +53,9 @@ public class VideoIngestionService : IngestionServiceBase, IIngestionService<Vid
         // PHASE 2: BULK create ALL pixel constants (ONE DB round-trip)
         // ============================================
         var pixelLookup = await BulkGetOrCreateConstantsAsync(
-            uniquePixels.ToArray(), 
-            SEED_TYPE_INTEGER, 
-            "pixel", 
+            uniquePixels.ToArray(),
+            SEED_TYPE_INTEGER,
+            null,
             ct);
 
         // ============================================
@@ -79,15 +79,15 @@ public class VideoIngestionService : IngestionServiceBase, IIngestionService<Vid
         var trackId = await CreateCompositionAsync(
             frameAtomIds,
             Enumerable.Repeat(1, frameAtomIds.Length).ToArray(),
-            "video_track",
+            null,
             ct
         );
 
-        // Store metadata
-        var widthAtom = await GetOrCreateConstantAsync((uint)video.Width, SEED_TYPE_INTEGER, "video_meta", ct);
-        var heightAtom = await GetOrCreateConstantAsync((uint)video.Height, SEED_TYPE_INTEGER, "video_meta", ct);
-        var fpsAtom = await GetOrCreateConstantAsync((uint)(video.FrameRate * 1000), SEED_TYPE_INTEGER, "video_meta", ct);
-        var frameCountAtom = await GetOrCreateConstantAsync((uint)video.Frames.Count, SEED_TYPE_INTEGER, "video_meta", ct);
+        // Store metadata as composition: [track, width, height, fps, frameCount, ?audio]
+        var widthAtom = await GetOrCreateConstantAsync((uint)video.Width, SEED_TYPE_INTEGER, null, ct);
+        var heightAtom = await GetOrCreateConstantAsync((uint)video.Height, SEED_TYPE_INTEGER, null, ct);
+        var fpsAtom = await GetOrCreateConstantAsync((uint)(video.FrameRate * 1000), SEED_TYPE_INTEGER, null, ct);
+        var frameCountAtom = await GetOrCreateConstantAsync((uint)video.Frames.Count, SEED_TYPE_INTEGER, null, ct);
 
         var metaRefs = new List<long> { trackId, widthAtom, heightAtom, fpsAtom, frameCountAtom };
         var metaMults = new List<int> { 1, 1, 1, 1, 1 };
@@ -102,7 +102,7 @@ public class VideoIngestionService : IngestionServiceBase, IIngestionService<Vid
         var videoId = await CreateCompositionAsync(
             metaRefs.ToArray(),
             metaMults.ToArray(),
-            "video",
+            null,
             ct
         );
 
@@ -133,21 +133,20 @@ public class VideoIngestionService : IngestionServiceBase, IIngestionService<Vid
                 pixelAtomIds[i] = pixelLookup[refs[i]];
             }
 
-            rowAtomIds[y] = await CreateCompositionAsync(pixelAtomIds, mults, "video_row", ct);
+            rowAtomIds[y] = await CreateCompositionAsync(pixelAtomIds, mults, null, ct);
         }
 
         return await CreateCompositionAsync(
             rowAtomIds,
             Enumerable.Repeat(1, rowAtomIds.Length).ToArray(),
-            "video_frame",
+            null,
             ct
         );
     }
 
     public async Task<VideoData> ReconstructAsync(long compositionId, CancellationToken ct = default)
     {
-        var video = await Context.Atoms
-            .FirstOrDefaultAsync(a => a.Id == compositionId && a.AtomType == "video", ct);
+        var video = await Context.Atoms.FindAsync(new object[] { compositionId }, ct);
 
         if (video?.Refs == null || video.Refs.Length < 5)
             throw new InvalidOperationException($"Invalid video atom {compositionId}");
@@ -164,8 +163,7 @@ public class VideoIngestionService : IngestionServiceBase, IIngestionService<Vid
 
         long? audioAtomId = video.Refs.Length > 5 ? video.Refs[5] : null;
 
-        var trackAtom = await Context.Atoms
-            .FirstOrDefaultAsync(a => a.Id == trackAtomId && a.AtomType == "video_track", ct);
+        var trackAtom = await Context.Atoms.FindAsync(new object[] { trackAtomId }, ct);
 
         if (trackAtom?.Refs == null)
             throw new InvalidOperationException("Invalid video track atom");
@@ -183,8 +181,7 @@ public class VideoIngestionService : IngestionServiceBase, IIngestionService<Vid
 
     private async Task<uint[]> ReconstructFrameAsync(long frameId, int width, int height, CancellationToken ct)
     {
-        var frameAtom = await Context.Atoms
-            .FirstOrDefaultAsync(a => a.Id == frameId && a.AtomType == "video_frame", ct);
+        var frameAtom = await Context.Atoms.FindAsync(new object[] { frameId }, ct);
 
         if (frameAtom?.Refs == null)
             return new uint[width * height];

@@ -153,6 +153,16 @@ public class ModelIngestionService : IngestionServiceBase
     }
 
     /// <summary>
+    /// Atomize a model name string for use in Descriptors.
+    /// Returns the atom ID for the model name text composition.
+    /// </summary>
+    public async Task<long> AtomizeModelNameAsync(string modelName, CancellationToken ct = default)
+    {
+        var result = await BulkIngestTokenTextsAsync(new[] { modelName }, ct);
+        return result.TryGetValue(modelName, out var atomId) ? atomId : 0;
+    }
+
+    /// <summary>
     /// Ingest vocabulary from tokenizer file (JSON format).
     /// Each token goes through HierarchicalTextIngestionService for deduplication.
     /// Same "the" across ALL models = same atom ID.
@@ -336,8 +346,7 @@ public class ModelIngestionService : IngestionServiceBase
                 IsConstant = true,
                 SeedValue = cp,
                 SeedType = SEED_TYPE_UNICODE,
-                ContentHash = hash,
-                AtomType = "vocab_token"
+                ContentHash = hash
             });
         }).ToList();
 
@@ -393,8 +402,7 @@ public class ModelIngestionService : IngestionServiceBase
                 IsConstant = true,
                 SeedValue = val,
                 SeedType = SEED_TYPE_INTEGER,
-                ContentHash = hash,
-                AtomType = "vocab_byte_token"
+                ContentHash = hash
             });
         }).ToList();
 
@@ -444,9 +452,10 @@ public class ModelIngestionService : IngestionServiceBase
             textToHash[text] = hash;
         }
 
-        // Load ALL composition atoms - filter in memory since byte[] comparison in EF is unreliable
+        // Load composition atoms - filter by content hash matching
+        var allHashes = textToHash.Values.Select(h => h).ToList();
         var existingCompositions = await Context.Atoms
-            .Where(a => !a.IsConstant && a.AtomType == "vocab_token")
+            .Where(a => !a.IsConstant && a.ContentHash != null)
             .Select(a => new { a.Id, a.ContentHash })
             .ToListAsync(ct);
 
@@ -527,8 +536,7 @@ public class ModelIngestionService : IngestionServiceBase
                 IsConstant = false,
                 Refs = refs,
                 Multiplicities = mults,
-                ContentHash = hash,
-                AtomType = "vocab_token"
+                ContentHash = hash
             }));
         }
 
@@ -562,44 +570,24 @@ public class ModelIngestionService : IngestionServiceBase
         // Using simple projection: first 3 principal components approximation
         var (x, y, z) = ReduceToSpatial3D(embedding);
 
-        // Update the atom with spatial geometry (POINTZ)
-        var atom = await Context.Atoms.FindAsync(new object[] { fullEmbeddingAtomId }, ct);
-        if (atom != null)
-        {
-            // Create POINTZ geometry for PostGIS spatial indexing
-            var spatialPoint = GeometryFactory.CreatePoint(new CoordinateZ(x, y, z));
-
-            // Store model/token info in metadata
-            var metadata = new
-            {
-                model = modelName,
-                token_id = tokenId,
-                dimensions = embedding.Length,
-                spatial_reduced = true
-            };
-
-            atom.Metadata = JsonSerializer.Serialize(metadata);
-            // Note: The main geom is already set from the composition,
-            // but we could add a secondary spatial index if needed
-
-            await Context.SaveChangesAsync(ct);
-        }
+        // The embedding atom already has geometry from its composition
+        // Additional spatial metadata could be stored as Descriptors if needed
 
         return fullEmbeddingAtomId;
     }
 
     /// <summary>
     /// Ingest attention weights as trajectories (LINESTRING between token positions).
-    /// 
-    /// Each weight becomes: (from_token, to_token, weight_value) → LINESTRING + weight atom
-    /// Enables spatial queries: "Find all attention paths from 'Captain' to 'whale'"
+    ///
+    /// Each weight becomes: [from_token, to_token, weight_value, layer, head] → LINESTRING
+    /// Enables spatial queries: "Find all attention paths from 'Captain' to 'whale' in layer 12"
     /// </summary>
     public async Task<long> IngestAttentionWeightsAsync(
         float[,] weights,
         int layer,
         int head,
         Dictionary<int, long> tokenPositionToAtomId,
-        string modelName,
+        long modelNameAtomId,
         CancellationToken ct = default)
     {
         var rows = weights.GetLength(0);
@@ -629,9 +617,9 @@ public class ModelIngestionService : IngestionServiceBase
                     continue;
                 }
 
-                // Create trajectory atom
+                // Create trajectory atom [from, to, weight, layer, head] with model in Descriptors
                 var trajectoryAtomId = await CreateTrajectoryAsync(
-                    fromAtomId, toAtomId, weight, layer, head, modelName, ct);
+                    fromAtomId, toAtomId, weight, layer, head, modelNameAtomId, ct);
 
                 trajectoryAtomIds.Add(trajectoryAtomId);
             }
@@ -647,7 +635,7 @@ public class ModelIngestionService : IngestionServiceBase
         var headCompositionId = await CreateCompositionAsync(
             trajectoryAtomIds.ToArray(),
             Enumerable.Repeat(1, trajectoryAtomIds.Count).ToArray(),
-            "attention_head",
+            null,
             ct);
 
         Logger?.LogDebug("Created attention head composition with {Count} trajectories", trajectoryAtomIds.Count);
@@ -658,6 +646,8 @@ public class ModelIngestionService : IngestionServiceBase
     /// <summary>
     /// Create a trajectory atom representing attention from one token to another.
     /// Stored as LINESTRING between the spatial positions of the tokens.
+    /// Structure: Refs = [from, to, weight, layer, head], Descriptors = [model_name_atom]
+    /// Enables querying by layer, head, or model.
     /// </summary>
     private async Task<long> CreateTrajectoryAsync(
         long fromAtomId,
@@ -665,7 +655,7 @@ public class ModelIngestionService : IngestionServiceBase
         float weight,
         int layer,
         int head,
-        string modelName,
+        long modelNameAtomId,
         CancellationToken ct = default)
     {
         // Get source and target atom geometries
@@ -684,11 +674,15 @@ public class ModelIngestionService : IngestionServiceBase
 
         // Create weight constant atom
         uint weightBits = BitConverter.SingleToUInt32Bits(weight);
-        var weightAtomId = await GetOrCreateConstantAsync(weightBits, SEED_TYPE_FLOAT_BITS, "attention_weight", ct);
+        var weightAtomId = await GetOrCreateConstantAsync(weightBits, SEED_TYPE_FLOAT_BITS, null, ct);
 
-        // Compute content hash for trajectory
-        var refs = new[] { fromAtomId, toAtomId, weightAtomId };
-        var multiplicities = new[] { 1, 1, 1 };
+        // Create layer and head constant atoms
+        var layerAtomId = await GetOrCreateIntegerConstantAsync(layer, null, ct);
+        var headAtomId = await GetOrCreateIntegerConstantAsync(head, null, ct);
+
+        // Structure: [from, to, weight, layer, head]
+        var refs = new[] { fromAtomId, toAtomId, weightAtomId, layerAtomId, headAtomId };
+        var multiplicities = new[] { 1, 1, 1, 1, 1 };
         var contentHash = HartNative.ComputeCompositionHash(refs, multiplicities);
 
         // Check for existing (content-addressed deduplication)
@@ -709,17 +703,7 @@ public class ModelIngestionService : IngestionServiceBase
             M = double.IsNaN(centroid.M) ? 0 : centroid.M
         });
 
-        // Metadata with attention info
-        var metadata = new
-        {
-            model = modelName,
-            layer,
-            head,
-            weight,
-            from_atom = fromAtomId,
-            to_atom = toAtomId
-        };
-
+        // Trajectory: Refs = [from, to, weight, layer, head], Descriptors = [model]
         var trajectoryAtom = new Atom
         {
             HilbertHigh = hilbert.High,
@@ -729,8 +713,7 @@ public class ModelIngestionService : IngestionServiceBase
             Refs = refs,
             Multiplicities = multiplicities,
             ContentHash = contentHash,
-            AtomType = "attention_trajectory",
-            Metadata = JsonSerializer.Serialize(metadata)
+            Descriptors = new[] { modelNameAtomId }
         };
 
         Context.Atoms.Add(trajectoryAtom);
@@ -815,26 +798,8 @@ public class ModelIngestionService : IngestionServiceBase
         // Convert to floats based on dtype
         var floats = ConvertBytesToFloats(dataBytes, tensorInfo.DType);
 
-        // Ingest as embedding composition
+        // Ingest as embedding composition - structure is self-describing
         var atomId = await _embeddingService.IngestAsync(floats, ct);
-
-        // Update with tensor metadata
-        var atom = await Context.Atoms.FindAsync(new object[] { atomId }, ct);
-        if (atom != null)
-        {
-            var metadata = new
-            {
-                model = modelName,
-                tensor_name = tensorInfo.Name,
-                dtype = tensorInfo.DType,
-                shape = tensorInfo.Shape,
-                total_elements = tensorInfo.TotalElements
-            };
-            atom.Metadata = JsonSerializer.Serialize(metadata);
-            atom.AtomType = IsEmbeddingTensor(tensorInfo.Name) ? "model_embedding" : "model_weight";
-            await Context.SaveChangesAsync(ct);
-        }
-
         return atomId;
     }
 
@@ -944,13 +909,7 @@ public class ModelIngestionService : IngestionServiceBase
             M = double.IsNaN(centroid.M) ? 0 : centroid.M
         });
 
-        var modelMetadata = new
-        {
-            model_name = modelName,
-            tensor_count = tensorAtomIds.Length,
-            safetensor_metadata = metadata.Metadata
-        };
-
+        // Model is composition of tensor atoms - structure is self-describing
         var atom = new Atom
         {
             HilbertHigh = hilbert.High,
@@ -959,9 +918,7 @@ public class ModelIngestionService : IngestionServiceBase
             IsConstant = false,
             Refs = tensorAtomIds,
             Multiplicities = multiplicities,
-            ContentHash = contentHash,
-            AtomType = "ai_model",
-            Metadata = JsonSerializer.Serialize(modelMetadata)
+            ContentHash = contentHash
         };
 
         Context.Atoms.Add(atom);

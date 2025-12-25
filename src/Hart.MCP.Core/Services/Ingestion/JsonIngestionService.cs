@@ -47,7 +47,7 @@ public class JsonIngestionService : IngestionServiceBase, IIngestionService<Json
         // PHASE 2: BULK create ALL primitive constants
         // ============================================
         var charLookup = await BulkGetOrCreateConstantsAsync(
-            uniqueChars.ToArray(), SEED_TYPE_UNICODE, "char", ct);
+            uniqueChars.ToArray(), SEED_TYPE_UNICODE, null, ct);
         
         // For integers/floats, we use GetOrCreateIntegerConstantAsync which is still
         // per-item, but these are typically few in number compared to char constants.
@@ -55,13 +55,14 @@ public class JsonIngestionService : IngestionServiceBase, IIngestionService<Json
         var intLookup = new Dictionary<long, long>();
         foreach (var val in uniqueInts)
         {
-            intLookup[val] = await GetOrCreateIntegerConstantAsync(val, "json_int", ct);
+            intLookup[val] = await GetOrCreateIntegerConstantAsync(val, null, ct);
         }
 
         var floatLookup = new Dictionary<ulong, long>();
         foreach (var bits in uniqueFloats)
         {
-            floatLookup[bits] = await GetOrCreateIntegerConstantAsync((long)bits, "json_float", ct);
+            // Store as double precision bits (SEED_TYPE_FLOAT_BITS stores uint32, we need uint64 for double)
+            floatLookup[bits] = await GetOrCreateIntegerConstantAsync((long)bits, null, ct);
         }
 
         // ============================================
@@ -145,9 +146,9 @@ public class JsonIngestionService : IngestionServiceBase, IIngestionService<Json
             JsonValueKind.Array => await IngestArrayAsync(element, charLookup, intLookup, floatLookup, ct),
             JsonValueKind.String => await IngestStringValueAsync(element.GetString()!, charLookup, ct),
             JsonValueKind.Number => IngestNumber(element, intLookup, floatLookup),
-            JsonValueKind.True => await GetOrCreateConstantAsync(1, SEED_TYPE_INTEGER, "json_bool", ct),
-            JsonValueKind.False => await GetOrCreateConstantAsync(0, SEED_TYPE_INTEGER, "json_bool", ct),
-            JsonValueKind.Null => await GetOrCreateConstantAsync(0xFFFFFFFF, SEED_TYPE_INTEGER, "json_null", ct),
+            JsonValueKind.True => await GetOrCreateConstantAsync(1, SEED_TYPE_INTEGER, null, ct),
+            JsonValueKind.False => await GetOrCreateConstantAsync(0, SEED_TYPE_INTEGER, null, ct),
+            JsonValueKind.Null => await GetOrCreateConstantAsync(0xFFFFFFFF, SEED_TYPE_INTEGER, null, ct),
             _ => throw new ArgumentException($"Unknown JSON value kind: {element.ValueKind}")
         };
     }
@@ -186,7 +187,7 @@ public class JsonIngestionService : IngestionServiceBase, IIngestionService<Json
             var pairId = await CreateCompositionAsync(
                 new[] { keyAtomId, valueAtomId },
                 new[] { 1, 1 },
-                "json_pair",
+                null,
                 ct
             );
             pairAtomIds.Add(pairId);
@@ -195,14 +196,14 @@ public class JsonIngestionService : IngestionServiceBase, IIngestionService<Json
         if (pairAtomIds.Count == 0)
         {
             // Empty object - special marker
-            var emptyMarker = await GetOrCreateConstantAsync(0xFFFFFFFE, SEED_TYPE_INTEGER, "json_empty_object", ct);
+            var emptyMarker = await GetOrCreateConstantAsync(0xFFFFFFFE, SEED_TYPE_INTEGER, null, ct);
             return emptyMarker;
         }
 
         return await CreateCompositionAsync(
             pairAtomIds.ToArray(),
             Enumerable.Repeat(1, pairAtomIds.Count).ToArray(),
-            "json_object",
+            null,
             ct
         );
     }
@@ -225,14 +226,14 @@ public class JsonIngestionService : IngestionServiceBase, IIngestionService<Json
         if (elementAtomIds.Count == 0)
         {
             // Empty array - special marker
-            var emptyMarker = await GetOrCreateConstantAsync(0xFFFFFFFD, SEED_TYPE_INTEGER, "json_empty_array", ct);
+            var emptyMarker = await GetOrCreateConstantAsync(0xFFFFFFFD, SEED_TYPE_INTEGER, null, ct);
             return emptyMarker;
         }
 
         return await CreateCompositionAsync(
             elementAtomIds.ToArray(),
             Enumerable.Repeat(1, elementAtomIds.Count).ToArray(),
-            "json_array",
+            null,
             ct
         );
     }
@@ -244,7 +245,7 @@ public class JsonIngestionService : IngestionServiceBase, IIngestionService<Json
     {
         if (string.IsNullOrEmpty(str))
         {
-            return await GetOrCreateConstantAsync(0xFFFFFFFC, SEED_TYPE_INTEGER, "json_empty_string", ct);
+            return await GetOrCreateConstantAsync(0xFFFFFFFC, SEED_TYPE_INTEGER, null, ct);
         }
 
         // RLE compress and use lookup
@@ -265,7 +266,7 @@ public class JsonIngestionService : IngestionServiceBase, IIngestionService<Json
             i += count;
         }
 
-        return await CreateCompositionAsync(atomIds.ToArray(), multiplicities.ToArray(), "json_string", ct);
+        return await CreateCompositionAsync(atomIds.ToArray(), multiplicities.ToArray(), null, ct);
     }
 
     public async Task<JsonElement> ReconstructAsync(long compositionId, CancellationToken ct = default)
@@ -280,30 +281,62 @@ public class JsonIngestionService : IngestionServiceBase, IIngestionService<Json
 
     private async Task<string> ReconstructToStringAsync(Entities.Atom atom, CancellationToken ct)
     {
-        // Handle special constants
+        // Handle constants based on SeedType and SeedValue
         if (atom.IsConstant)
         {
-            return atom.AtomType switch
+            return atom.SeedType switch
             {
-                "json_bool" => atom.SeedValue == 1 ? "true" : "false",
-                "json_null" => "null",
-                "json_empty_object" => "{}",
-                "json_empty_array" => "[]",
-                "json_empty_string" => "\"\"",
-                "json_int" => atom.SeedValue?.ToString() ?? "0",
-                "json_float" => BitConverter.UInt64BitsToDouble((ulong)(atom.SeedValue ?? 0)).ToString("G17"),
-                _ => throw new InvalidOperationException($"Unknown JSON constant type: {atom.AtomType}")
+                SEED_TYPE_UNICODE => char.ConvertFromUtf32((int)(atom.SeedValue ?? 0)),
+                SEED_TYPE_INTEGER => atom.SeedValue switch
+                {
+                    0 => "false",              // JSON false
+                    1 => "true",               // JSON true
+                    0xFFFFFFFF => "null",      // JSON null
+                    0xFFFFFFFE => "{}",        // Empty object
+                    0xFFFFFFFD => "[]",        // Empty array
+                    0xFFFFFFFC => "\"\"",      // Empty string
+                    var v => v?.ToString() ?? "0"  // Regular integer
+                },
+                SEED_TYPE_FLOAT_BITS => BitConverter.UInt64BitsToDouble((ulong)(atom.SeedValue ?? 0)).ToString("G17"),
+                _ => throw new InvalidOperationException($"Unknown constant SeedType: {atom.SeedType}")
             };
         }
 
-        return atom.AtomType switch
+        // Compositions - infer type from structure
+        if (atom.Refs == null || atom.Refs.Length == 0)
+            return "null";
+
+        // Check first ref to determine structure type
+        var firstRef = await Context.Atoms.FindAsync(new object[] { atom.Refs[0] }, ct);
+        if (firstRef == null)
+            return "null";
+
+        // Key-value pair = [key, value] where key is a string composition
+        if (atom.Refs.Length == 2 && !firstRef.IsConstant && firstRef.Refs?.Length > 0)
         {
-            "json_object" => await ReconstructObjectAsync(atom, ct),
-            "json_array" => await ReconstructArrayAsync(atom, ct),
-            "json_string" => await ReconstructStringAsync(atom, ct),
-            "json_pair" => throw new InvalidOperationException("Cannot reconstruct pair directly"),
-            _ => throw new InvalidOperationException($"Unknown JSON atom type: {atom.AtomType}")
-        };
+            // Could be a pair - check if first is a char composition (string key)
+            var firstOfFirst = await Context.Atoms.FindAsync(new object[] { firstRef.Refs[0] }, ct);
+            if (firstOfFirst?.IsConstant == true && firstOfFirst.SeedType == SEED_TYPE_UNICODE)
+            {
+                // This is a pair - reconstruct as object with one property
+                throw new InvalidOperationException("Cannot reconstruct pair directly");
+            }
+        }
+
+        // Array of pairs = object
+        if (!firstRef.IsConstant && firstRef.Refs?.Length == 2)
+        {
+            return await ReconstructObjectAsync(atom, ct);
+        }
+
+        // Array of char constants = string
+        if (firstRef.IsConstant && firstRef.SeedType == SEED_TYPE_UNICODE)
+        {
+            return await ReconstructStringAsync(atom, ct);
+        }
+
+        // Otherwise treat as array
+        return await ReconstructArrayAsync(atom, ct);
     }
 
     private async Task<string> ReconstructObjectAsync(Entities.Atom obj, CancellationToken ct)

@@ -87,21 +87,20 @@ public class Atom
     public byte[] ContentHash { get; set; } = null!;
 
     /// <summary>
-    /// Optional atom type hint for quick filtering
-    /// Examples: "char", "word", "sentence", "embedding", "weight",
-    /// "ai_model", "model_layer", "conversation", "turn", "annotation"
+    /// Reference to type atom (char, word, pattern, weight_edge, etc.)
+    /// Types are themselves atoms - this enables type hierarchies and queries.
+    /// NULL only for bootstrap type atoms that define themselves.
     /// </summary>
-    [Column("atom_type")]
-    [MaxLength(64)]
-    public string? AtomType { get; set; }
+    [Column("type_ref")]
+    public long? TypeRef { get; set; }
 
     /// <summary>
-    /// Application-layer metadata as JSONB
-    /// Stores non-spatial properties: names, descriptions, config, etc.
-    /// All legacy entity properties go here instead of separate tables.
+    /// Optional descriptors: atom IDs that describe this atom.
+    /// Replaces JSONB metadata - all descriptors are atoms.
+    /// Example: [name_atom_id, description_atom_id, config_atom_id]
     /// </summary>
-    [Column("metadata", TypeName = "jsonb")]
-    public string? Metadata { get; set; }
+    [Column("descriptors")]
+    public long[]? Descriptors { get; set; }
 
     /// <summary>
     /// Creation timestamp

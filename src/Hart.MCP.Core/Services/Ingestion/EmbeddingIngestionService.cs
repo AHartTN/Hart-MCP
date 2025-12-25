@@ -45,9 +45,9 @@ public class EmbeddingIngestionService : IngestionServiceBase, IIngestionService
         // PHASE 2: BULK create ALL component constants (ONE DB round-trip)
         // ============================================
         var bitsLookup = await BulkGetOrCreateConstantsAsync(
-            uniqueBits.ToArray(), 
-            SEED_TYPE_FLOAT_BITS, 
-            "embedding_component", 
+            uniqueBits.ToArray(),
+            SEED_TYPE_FLOAT_BITS,
+            null, // typeRef
             ct);
 
         // ============================================
@@ -64,7 +64,7 @@ public class EmbeddingIngestionService : IngestionServiceBase, IIngestionService
         var embeddingId = await CreateCompositionAsync(
             componentAtomIds,
             Enumerable.Repeat(1, componentAtomIds.Length).ToArray(),
-            "embedding",
+            null, // typeRef
             ct
         );
 
@@ -75,7 +75,7 @@ public class EmbeddingIngestionService : IngestionServiceBase, IIngestionService
     public async Task<float[]> ReconstructAsync(long compositionId, CancellationToken ct = default)
     {
         var embedding = await Context.Atoms
-            .FirstOrDefaultAsync(a => a.Id == compositionId && a.AtomType == "embedding", ct);
+            .FirstOrDefaultAsync(a => a.Id == compositionId && !a.IsConstant, ct);
 
         if (embedding?.Refs == null)
             throw new InvalidOperationException($"Invalid embedding atom {compositionId}");
@@ -115,15 +115,15 @@ public class EmbeddingIngestionService : IngestionServiceBase, IIngestionService
         {
             // Convert double to IEEE754 bits (64-bit)
             ulong bits = BitConverter.DoubleToUInt64Bits(embedding[i]);
-            
+
             // Store as 64-bit integer constant
-            componentAtomIds[i] = await GetOrCreateIntegerConstantAsync((long)bits, "embedding_component_f64", ct);
+            componentAtomIds[i] = await GetOrCreateIntegerConstantAsync((long)bits, null, ct);
         }
 
         var embeddingId = await CreateCompositionAsync(
             componentAtomIds,
             Enumerable.Repeat(1, componentAtomIds.Length).ToArray(),
-            "embedding_f64",
+            null, // typeRef
             ct
         );
 
@@ -137,7 +137,7 @@ public class EmbeddingIngestionService : IngestionServiceBase, IIngestionService
     public async Task<double[]> ReconstructDoubleAsync(long compositionId, CancellationToken ct = default)
     {
         var embedding = await Context.Atoms
-            .FirstOrDefaultAsync(a => a.Id == compositionId && a.AtomType == "embedding_f64", ct);
+            .FirstOrDefaultAsync(a => a.Id == compositionId && !a.IsConstant, ct);
 
         if (embedding?.Refs == null)
             throw new InvalidOperationException($"Invalid embedding atom {compositionId}");
