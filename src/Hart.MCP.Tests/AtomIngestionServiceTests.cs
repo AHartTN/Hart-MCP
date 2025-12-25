@@ -269,7 +269,7 @@ public class AtomIngestionServiceTests : IDisposable
         
         constant.Should().NotBeNull();
         constant!.SeedValue.Should().Be(codepoint);
-        constant.SeedType.Should().Be(1, because: "1 = SEED_TYPE_UNICODE");
+        constant.SeedType.Should().Be(0, because: "0 = SEED_TYPE_UNICODE");
         constant.ContentHash.Should().HaveCount(32, because: "BLAKE3 produces 32-byte hashes");
         constant.Geom.Should().NotBeNull(because: "all constants have spatial coordinates");
         

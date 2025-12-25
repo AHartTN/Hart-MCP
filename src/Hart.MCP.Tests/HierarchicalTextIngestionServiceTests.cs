@@ -9,6 +9,30 @@ using Xunit;
 namespace Hart.MCP.Tests;
 
 /// <summary>
+/// Collection definition for database tests - ensures serial execution.
+/// </summary>
+[CollectionDefinition("Database", DisableParallelization = true)]
+public class DatabaseCollection : ICollectionFixture<DatabaseFixture> { }
+
+/// <summary>
+/// Shared fixture for database tests.
+/// </summary>
+public class DatabaseFixture : IDisposable
+{
+    public const string ConnectionString = "Host=localhost;Port=5432;Database=HART-MCP;Username=hartonomous;Password=hartonomous";
+    
+    public DatabaseFixture()
+    {
+        // One-time setup if needed
+    }
+    
+    public void Dispose()
+    {
+        // One-time cleanup if needed
+    }
+}
+
+/// <summary>
 /// Tests for HierarchicalTextIngestionService.
 /// 
 /// CORE GUARANTEES TESTED:
@@ -19,6 +43,7 @@ namespace Hart.MCP.Tests;
 /// 
 /// KEY INNOVATION: "The cat in the hat" should store "the" ONCE, referenced TWICE
 /// </summary>
+[Collection("Database")]
 public class HierarchicalTextIngestionServiceTests : IDisposable
 {
     private const string ConnectionString = "Host=localhost;Port=5432;Database=HART-MCP;Username=hartonomous;Password=hartonomous";
@@ -179,6 +204,9 @@ public class HierarchicalTextIngestionServiceTests : IDisposable
     [Fact]
     public async Task Deduplication_CrossDocumentPatterns_SharedAcrossIngestions()
     {
+        // Capture initial count before this test
+        var initialConstantCount = await _context.Constants.CountAsync();
+        
         // Ingest texts sequentially, patterns should be reused
         var texts = new[]
         {
@@ -200,15 +228,13 @@ public class HierarchicalTextIngestionServiceTests : IDisposable
             reconstructed.Should().Be(texts[i]);
         }
 
-        // Character constants should be shared (e.g., 'h' appears in all three)
-        // Query constants by SeedType (0 = Unicode codepoint)
-        var charConstants = await _context.Constants
-            .Where(c => c.SeedType == 0)
-            .CountAsync();
+        // Count new constants created by this test
+        var finalConstantCount = await _context.Constants.CountAsync();
+        var newConstants = finalConstantCount - initialConstantCount;
 
-        // We shouldn't have duplicate character constants
+        // Calculate expected unique characters across all texts
         var allChars = string.Concat(texts).Distinct().Count();
-        charConstants.Should().BeLessThanOrEqualTo(allChars + 5, // Small buffer for test variance
+        newConstants.Should().BeLessThanOrEqualTo(allChars + 5, // Small buffer for test variance
             because: "character constants should be deduplicated across all texts");
     }
 

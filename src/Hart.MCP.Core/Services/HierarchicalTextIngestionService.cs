@@ -4,6 +4,7 @@ using Hart.MCP.Core.Native;
 using Microsoft.EntityFrameworkCore;
 using Microsoft.Extensions.Logging;
 using NetTopologySuite.Geometries;
+using Npgsql;
 using System.Text;
 
 namespace Hart.MCP.Core.Services;
@@ -281,58 +282,320 @@ public class HierarchicalTextIngestionService
         CancellationToken cancellationToken)
     {
         // ============================================
-        // STEP 1: Bulk get/create character constants
+        // STEP 1: Bulk get/create character constants (SINGLE BATCH)
         // ============================================
         var charAtomLookup = await BulkGetOrCreateCharConstantsAsync(
             uniqueCodepoints.Select(cp => (uint)cp).ToArray(), cancellationToken);
 
-        // ============================================
-        // STEP 2: Create compositions for rules (bottom-up by tier)
-        // ============================================
-        var ruleAtomLookup = new Dictionary<int, long>(); // ruleId -> atomId
+        // Cache all constant geometries for later use (single query)
+        var allConstantIds = charAtomLookup.Values.ToList();
+        var constantGeomCache = await _context.Constants
+            .Where(c => allConstantIds.Contains(c.Id))
+            .ToDictionaryAsync(c => c.Id, c => c.Geom, cancellationToken);
 
-        // Sort rules by tier (lower tiers first - they reference only chars)
+        // ============================================
+        // STEP 2: Create compositions for rules IN BATCH
+        // ============================================
+        var ruleAtomLookup = new Dictionary<int, long>();
         var sortedRules = rules.OrderBy(r => r.Tier).ToList();
 
-        foreach (var rule in sortedRules)
+        if (sortedRules.Count > 0)
         {
-            cancellationToken.ThrowIfCancellationRequested();
+            // Process rules in batches by tier (all rules in a tier can be created together)
+            var currentTier = sortedRules[0].Tier;
+            var tierBatch = new List<InMemoryRule>();
+            var compositionGeomCache = new Dictionary<long, Geometry>();
 
-            // Resolve left and right to atom IDs
-            long leftAtomId = ResolveSymbolToAtomId(rule.Left, charAtomLookup, ruleAtomLookup);
-            long rightAtomId = ResolveSymbolToAtomId(rule.Right, charAtomLookup, ruleAtomLookup);
-
-            // Create composition
-            var atomId = await CreateOrGetCompositionAsync(
-                new[] { leftAtomId, rightAtomId },
-                new[] { 1, 1 },
-                $"pattern_t{rule.Tier}",
-                cancellationToken);
-
-            ruleAtomLookup[rule.RuleId] = atomId;
+            foreach (var rule in sortedRules)
+            {
+                if (rule.Tier != currentTier)
+                {
+                    // Flush previous tier batch
+                    await CreateRuleBatchAsync(tierBatch, charAtomLookup, ruleAtomLookup, 
+                        constantGeomCache, compositionGeomCache, cancellationToken);
+                    tierBatch.Clear();
+                    currentTier = rule.Tier;
+                }
+                tierBatch.Add(rule);
+            }
+            // Flush final batch
+            if (tierBatch.Count > 0)
+            {
+                await CreateRuleBatchAsync(tierBatch, charAtomLookup, ruleAtomLookup,
+                    constantGeomCache, compositionGeomCache, cancellationToken);
+            }
         }
 
         // ============================================
-        // STEP 3: Create root composition from final sequence
+        // STEP 3: Create root composition from final sequence (SINGLE BATCH)
         // ============================================
-        var (rootRefs, rootMults) = ApplyRLECompression(finalSequence, charAtomLookup, ruleAtomLookup);
+        var (rootRefs, rootMults, rootIsConstantFlags) = ApplyRLECompression(finalSequence, charAtomLookup, ruleAtomLookup);
 
         if (rootRefs.Count == 1 && rootMults[0] == 1)
         {
-            // Single element - determine if it's a constant or composition
-            var singleRef = rootRefs[0];
-            // If it's in charAtomLookup values, it's a constant
-            bool isConstant = charAtomLookup.Values.Contains(singleRef);
-            return (singleRef, isConstant);
+            return (rootRefs[0], rootIsConstantFlags[0]);
         }
 
-        var rootAtomId = await CreateOrGetCompositionAsync(
-            rootRefs.ToArray(),
-            rootMults.ToArray(),
-            "document",
-            cancellationToken);
+        // Load all needed geometries in one query
+        var compositionRefsToLoad = new List<long>();
+        for (int i = 0; i < rootRefs.Count; i++)
+        {
+            if (!rootIsConstantFlags[i])
+                compositionRefsToLoad.Add(rootRefs[i]);
+        }
 
-        return (rootAtomId, false); // Compositions are never constants
+        var compositionGeomsForRoot = compositionRefsToLoad.Count > 0
+            ? await _context.Compositions
+                .Where(c => compositionRefsToLoad.Contains(c.Id))
+                .ToDictionaryAsync(c => c.Id, c => c.Geom, cancellationToken)
+            : new Dictionary<long, Geometry?>();
+
+        // Compute root hash and geometry
+        var childIsConstant = new Dictionary<long, bool>();
+        for (int i = 0; i < rootRefs.Count; i++)
+            childIsConstant[rootRefs[i]] = rootIsConstantFlags[i];
+
+        var contentHash = ComputeTypedCompositionHash(rootRefs.ToArray(), rootMults.ToArray(), childIsConstant);
+
+        // Check dedup
+        var existingRoot = await _context.Compositions
+            .Where(c => c.ContentHash == contentHash)
+            .Select(c => c.Id)
+            .FirstOrDefaultAsync(cancellationToken);
+
+        if (existingRoot != 0)
+            return (existingRoot, false);
+
+        // Build geometry from cached data
+        var coordinates = new List<CoordinateZM>();
+        for (int i = 0; i < rootRefs.Count; i++)
+        {
+            var refId = rootRefs[i];
+            Geometry? geom = rootIsConstantFlags[i] 
+                ? constantGeomCache.GetValueOrDefault(refId)
+                : compositionGeomsForRoot.GetValueOrDefault(refId);
+            if (geom != null)
+                coordinates.Add(ExtractRepresentativeCoordinate(geom));
+        }
+
+        Geometry rootGeom = coordinates.Count == 1
+            ? _geometryFactory.CreatePoint(coordinates[0])
+            : _geometryFactory.CreateLineString(coordinates.ToArray());
+
+        var centroid = rootGeom.Centroid.Coordinate;
+        var hilbert = NativeLibrary.point_to_hilbert(new NativeLibrary.PointZM
+        {
+            X = centroid.X, Y = centroid.Y,
+            Z = double.IsNaN(centroid.Z) ? 0 : centroid.Z,
+            M = double.IsNaN(centroid.M) ? 0 : centroid.M
+        });
+
+        var rootComposition = new Composition
+        {
+            HilbertHigh = (ulong)hilbert.High,
+            HilbertLow = (ulong)hilbert.Low,
+            Geom = rootGeom,
+            ContentHash = contentHash
+        };
+
+        _context.Compositions.Add(rootComposition);
+        await _context.SaveChangesAsync(cancellationToken);
+
+        // Create relations using PostgreSQL COPY for massive speedup
+        await BulkCopyRelationsAsync(
+            rootComposition.Id, rootRefs, rootMults, rootIsConstantFlags, cancellationToken);
+
+        return (rootComposition.Id, false);
+    }
+
+    /// <summary>
+    /// Bulk insert relations using PostgreSQL COPY command.
+    /// Orders of magnitude faster than EF Core for large batches.
+    /// </summary>
+    private async Task BulkCopyRelationsAsync(
+        long compositionId,
+        List<long> refs,
+        List<int> multiplicities,
+        List<bool> isConstant,
+        CancellationToken cancellationToken)
+    {
+        var conn = _context.Database.GetDbConnection() as NpgsqlConnection;
+        if (conn == null)
+            throw new InvalidOperationException("Database connection is not Npgsql");
+
+        var wasOpen = conn.State == System.Data.ConnectionState.Open;
+        if (!wasOpen)
+            await conn.OpenAsync(cancellationToken);
+
+        try
+        {
+            using var writer = await conn.BeginBinaryImportAsync(
+                "COPY relation (composition_id, position, multiplicity, child_constant_id, child_composition_id) FROM STDIN (FORMAT BINARY)",
+                cancellationToken);
+
+            for (int i = 0; i < refs.Count; i++)
+            {
+                await writer.StartRowAsync(cancellationToken);
+                await writer.WriteAsync(compositionId, NpgsqlTypes.NpgsqlDbType.Bigint, cancellationToken);
+                await writer.WriteAsync(i, NpgsqlTypes.NpgsqlDbType.Integer, cancellationToken);
+                await writer.WriteAsync(multiplicities[i], NpgsqlTypes.NpgsqlDbType.Integer, cancellationToken);
+
+                if (isConstant[i])
+                {
+                    await writer.WriteAsync(refs[i], NpgsqlTypes.NpgsqlDbType.Bigint, cancellationToken);
+                    await writer.WriteNullAsync(cancellationToken);
+                }
+                else
+                {
+                    await writer.WriteNullAsync(cancellationToken);
+                    await writer.WriteAsync(refs[i], NpgsqlTypes.NpgsqlDbType.Bigint, cancellationToken);
+                }
+            }
+
+            await writer.CompleteAsync(cancellationToken);
+        }
+        finally
+        {
+            if (!wasOpen)
+                await conn.CloseAsync();
+        }
+    }
+
+    /// <summary>
+    /// Create a batch of rule compositions in minimal DB calls.
+    /// </summary>
+    private async Task CreateRuleBatchAsync(
+        List<InMemoryRule> rules,
+        Dictionary<uint, long> charAtomLookup,
+        Dictionary<int, long> ruleAtomLookup,
+        Dictionary<long, Geometry?> constantGeomCache,
+        Dictionary<long, Geometry> compositionGeomCache,
+        CancellationToken cancellationToken)
+    {
+        if (rules.Count == 0) return;
+
+        // Prepare all rule data
+        var ruleData = new List<(InMemoryRule rule, long leftId, long rightId, bool leftIsConst, bool rightIsConst, byte[] hash)>();
+        
+        foreach (var rule in rules)
+        {
+            long leftId = ResolveSymbolToAtomId(rule.Left, charAtomLookup, ruleAtomLookup);
+            long rightId = ResolveSymbolToAtomId(rule.Right, charAtomLookup, ruleAtomLookup);
+            bool leftIsConst = rule.Left >= 0;
+            bool rightIsConst = rule.Right >= 0;
+            
+            var childIsConstant = new Dictionary<long, bool> { [leftId] = leftIsConst, [rightId] = rightIsConst };
+            var hash = ComputeTypedCompositionHash(new[] { leftId, rightId }, new[] { 1, 1 }, childIsConstant);
+            
+            ruleData.Add((rule, leftId, rightId, leftIsConst, rightIsConst, hash));
+        }
+
+        // Batch lookup existing compositions by hash
+        var allHashes = ruleData.Select(r => r.hash).ToList();
+        var existingByHash = await _context.Compositions
+            .Where(c => allHashes.Any(h => c.ContentHash == h))
+            .Select(c => new { c.Id, c.ContentHash, c.Geom })
+            .ToListAsync(cancellationToken);
+
+        var hashToExisting = existingByHash.ToDictionary(
+            c => Convert.ToHexString(c.ContentHash),
+            c => (c.Id, c.Geom));
+
+        // Separate into existing vs new
+        var newRules = new List<(InMemoryRule rule, long leftId, long rightId, bool leftIsConst, bool rightIsConst, byte[] hash)>();
+        foreach (var rd in ruleData)
+        {
+            var hashHex = Convert.ToHexString(rd.hash);
+            if (hashToExisting.TryGetValue(hashHex, out var existing))
+            {
+                ruleAtomLookup[rd.rule.RuleId] = existing.Id;
+                if (existing.Geom != null)
+                    compositionGeomCache[existing.Id] = existing.Geom;
+            }
+            else
+            {
+                newRules.Add(rd);
+            }
+        }
+
+        if (newRules.Count == 0) return;
+
+        // Create all new compositions in batch
+        var newCompositions = new List<(Composition comp, InMemoryRule rule, long leftId, long rightId, bool leftIsConst, bool rightIsConst)>();
+        foreach (var rd in newRules)
+        {
+            // Get geometries for children
+            Geometry? leftGeom = rd.leftIsConst 
+                ? constantGeomCache.GetValueOrDefault(rd.leftId)
+                : compositionGeomCache.GetValueOrDefault(rd.leftId);
+            Geometry? rightGeom = rd.rightIsConst
+                ? constantGeomCache.GetValueOrDefault(rd.rightId)
+                : compositionGeomCache.GetValueOrDefault(rd.rightId);
+
+            var coords = new List<CoordinateZM>();
+            if (leftGeom != null) coords.Add(ExtractRepresentativeCoordinate(leftGeom));
+            if (rightGeom != null) coords.Add(ExtractRepresentativeCoordinate(rightGeom));
+
+            Geometry geom = coords.Count switch
+            {
+                0 => _geometryFactory.CreatePoint(new CoordinateZM(0, 0, 0, 0)),
+                1 => _geometryFactory.CreatePoint(coords[0]),
+                _ => _geometryFactory.CreateLineString(coords.ToArray())
+            };
+
+            var centroid = geom.Centroid.Coordinate;
+            var hilbert = NativeLibrary.point_to_hilbert(new NativeLibrary.PointZM
+            {
+                X = centroid.X, Y = centroid.Y,
+                Z = double.IsNaN(centroid.Z) ? 0 : centroid.Z,
+                M = double.IsNaN(centroid.M) ? 0 : centroid.M
+            });
+
+            var comp = new Composition
+            {
+                HilbertHigh = (ulong)hilbert.High,
+                HilbertLow = (ulong)hilbert.Low,
+                Geom = geom,
+                ContentHash = rd.hash
+            };
+
+            newCompositions.Add((comp, rd.rule, rd.leftId, rd.rightId, rd.leftIsConst, rd.rightIsConst));
+        }
+
+        // Batch insert compositions
+        _context.Compositions.AddRange(newCompositions.Select(x => x.comp));
+        await _context.SaveChangesAsync(cancellationToken);
+
+        // Update lookups and caches
+        foreach (var (comp, rule, _, _, _, _) in newCompositions)
+        {
+            ruleAtomLookup[rule.RuleId] = comp.Id;
+            compositionGeomCache[comp.Id] = comp.Geom!;
+        }
+
+        // Batch create relations
+        var allRelations = new List<Relation>();
+        foreach (var (comp, _, leftId, rightId, leftIsConst, rightIsConst) in newCompositions)
+        {
+            allRelations.Add(new Relation
+            {
+                CompositionId = comp.Id,
+                Position = 0,
+                Multiplicity = 1,
+                ChildConstantId = leftIsConst ? leftId : null,
+                ChildCompositionId = leftIsConst ? null : leftId
+            });
+            allRelations.Add(new Relation
+            {
+                CompositionId = comp.Id,
+                Position = 1,
+                Multiplicity = 1,
+                ChildConstantId = rightIsConst ? rightId : null,
+                ChildCompositionId = rightIsConst ? null : rightId
+            });
+        }
+        _context.Relations.AddRange(allRelations);
+        await _context.SaveChangesAsync(cancellationToken);
     }
 
     /// <summary>
@@ -353,15 +616,17 @@ public class HierarchicalTextIngestionService
     }
 
     /// <summary>
-    /// Apply RLE compression and resolve symbols to atom IDs
+    /// Apply RLE compression and resolve symbols to atom IDs.
+    /// Also tracks whether each ref is a constant (true) or composition (false).
     /// </summary>
-    private (List<long> Refs, List<int> Multiplicities) ApplyRLECompression(
+    private (List<long> Refs, List<int> Multiplicities, List<bool> IsConstant) ApplyRLECompression(
         List<int> sequence,
         Dictionary<uint, long> charLookup,
         Dictionary<int, long> ruleLookup)
     {
         var refs = new List<long>();
         var mults = new List<int>();
+        var isConstant = new List<bool>();
 
         int i = 0;
         while (i < sequence.Count)
@@ -374,40 +639,29 @@ public class HierarchicalTextIngestionService
 
             refs.Add(ResolveSymbolToAtomId(current, charLookup, ruleLookup));
             mults.Add(count);
+            isConstant.Add(current >= 0); // Positive = char codepoint = constant
             i += count;
         }
 
-        return (refs, mults);
+        return (refs, mults, isConstant);
     }
 
     /// <summary>
-    /// Create or get existing composition atom (content-addressed deduplication)
+    /// Create or get existing composition atom (content-addressed deduplication).
+    /// The isConstant array specifies whether each ref is a constant (true) or composition (false).
     /// </summary>
     private async Task<long> CreateOrGetCompositionAsync(
         long[] refs,
         int[] multiplicities,
+        bool[] isConstant,
         string compositionType,
         CancellationToken cancellationToken)
     {
-        // First determine which refs are constants and which are compositions
-        var constantChildren = await _context.Constants
-            .Where(c => refs.Contains(c.Id))
-            .ToDictionaryAsync(c => c.Id, cancellationToken);
-
-        var compositionChildren = await _context.Compositions
-            .Where(c => refs.Contains(c.Id))
-            .ToDictionaryAsync(c => c.Id, cancellationToken);
-
-        // Build child type array for typed hash
+        // Build child type lookup from the provided isConstant array
         var childIsConstant = new Dictionary<long, bool>();
-        foreach (var refId in refs)
+        for (int i = 0; i < refs.Length; i++)
         {
-            if (constantChildren.ContainsKey(refId))
-                childIsConstant[refId] = true;
-            else if (compositionChildren.ContainsKey(refId))
-                childIsConstant[refId] = false;
-            else
-                throw new InvalidOperationException($"Referenced node {refId} not found in Constants or Compositions");
+            childIsConstant[refs[i]] = isConstant[i];
         }
 
         // Compute typed hash that distinguishes constant vs composition children
@@ -426,17 +680,39 @@ public class HierarchicalTextIngestionService
             return existing;
         }
 
+        // Collect IDs to fetch from each table
+        var constantIds = refs.Where((r, i) => isConstant[i]).Distinct().ToList();
+        var compositionIds = refs.Where((r, i) => !isConstant[i]).Distinct().ToList();
+
+        // Fetch the actual entities for geometry extraction
+        var constantChildren = constantIds.Count > 0
+            ? await _context.Constants
+                .Where(c => constantIds.Contains(c.Id))
+                .ToDictionaryAsync(c => c.Id, cancellationToken)
+            : new Dictionary<long, Constant>();
+
+        var compositionChildren = compositionIds.Count > 0
+            ? await _context.Compositions
+                .Where(c => compositionIds.Contains(c.Id))
+                .ToDictionaryAsync(c => c.Id, cancellationToken)
+            : new Dictionary<long, Composition>();
+
         // Build geometry from child points
         var coordinates = new List<CoordinateZM>();
-        foreach (var refId in refs)
+        for (int i = 0; i < refs.Length; i++)
         {
-            if (constantChildren.TryGetValue(refId, out var constantChild))
+            var refId = refs[i];
+            if (isConstant[i])
             {
-                coordinates.Add(ExtractRepresentativeCoordinate(constantChild.Geom));
+                if (!constantChildren.TryGetValue(refId, out var constant))
+                    throw new InvalidOperationException($"Constant {refId} not found");
+                coordinates.Add(ExtractRepresentativeCoordinate(constant.Geom));
             }
-            else if (compositionChildren.TryGetValue(refId, out var compositionChild))
+            else
             {
-                coordinates.Add(ExtractRepresentativeCoordinate(compositionChild.Geom));
+                if (!compositionChildren.TryGetValue(refId, out var comp))
+                    throw new InvalidOperationException($"Composition {refId} not found");
+                coordinates.Add(ExtractRepresentativeCoordinate(comp.Geom));
             }
         }
 
@@ -479,7 +755,7 @@ public class HierarchicalTextIngestionService
                 Position = i,
                 Multiplicity = multiplicities[i]
             };
-            if (childIsConstant[refs[i]])
+            if (isConstant[i])
                 relation.ChildConstantId = refs[i];
             else
                 relation.ChildCompositionId = refs[i];
@@ -516,6 +792,8 @@ public class HierarchicalTextIngestionService
         var missing = codepoints.Where(cp => !result.ContainsKey(cp)).ToList();
         if (missing.Count > 0)
         {
+            var newConstants = new List<Constant>();
+            
             foreach (var cp in missing)
             {
                 var contentHash = NativeLibrary.ComputeSeedHash(cp);
@@ -534,19 +812,13 @@ public class HierarchicalTextIngestionService
                 };
 
                 _context.Constants.Add(constant);
-                result[cp] = 0; // Placeholder, will be set after save
+                newConstants.Add(constant);
             }
 
             await _context.SaveChangesAsync(cancellationToken);
 
-            // Re-query to get assigned IDs
-            var newlyCreated = await _context.Constants
-                .Where(c => c.SeedType == 0 && // SEED_TYPE_UNICODE
-                           missing.Select(m => (long)m).Contains(c.SeedValue))
-                .Select(c => new { c.Id, c.SeedValue })
-                .ToListAsync(cancellationToken);
-
-            foreach (var constant in newlyCreated)
+            // EF Core updates the Id property after SaveChangesAsync
+            foreach (var constant in newConstants)
             {
                 result[(uint)constant.SeedValue] = constant.Id;
             }

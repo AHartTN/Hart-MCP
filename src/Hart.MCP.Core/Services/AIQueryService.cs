@@ -397,7 +397,19 @@ public class AIQueryService
                     Depth = depth,
                     IsToConstant = true
                 });
-                // Constants are leaf nodes, no further traversal
+                
+                // Add constant as a leaf node if not already visited
+                if (!visited.Contains(relation.ChildConstantId.Value))
+                {
+                    visited.Add(relation.ChildConstantId.Value);
+                    chain.Nodes.Add(new ChainNode
+                    {
+                        NodeId = relation.ChildConstantId.Value,
+                        Depth = depth + 1,
+                        TypeId = null, // Constants don't have TypeId
+                        IsConstant = true
+                    });
+                }
             }
             else if (relation.ChildCompositionId.HasValue)
             {

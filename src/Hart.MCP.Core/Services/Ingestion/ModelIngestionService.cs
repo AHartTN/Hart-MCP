@@ -421,83 +421,15 @@ public class ModelIngestionService : IngestionServiceBase
         string[] texts, CancellationToken ct)
     {
         var result = new Dictionary<string, long>();
+        var uniqueTexts = texts.Distinct().ToArray();
         
-        // Compute content hashes for all texts (byte[] hashes)
-        var textToHash = new Dictionary<string, byte[]>();
-        foreach (var text in texts.Distinct())
-        {
-            // Extract codepoints for hash computation
-            var codepoints = new List<int>();
-            for (int i = 0; i < text.Length; i++)
-            {
-                if (char.IsHighSurrogate(text[i]) && i + 1 < text.Length && char.IsLowSurrogate(text[i + 1]))
-                {
-                    codepoints.Add(char.ConvertToUtf32(text[i], text[i + 1]));
-                    i++;
-                }
-                else
-                {
-                    codepoints.Add(text[i]);
-                }
-            }
-            
-            // Compute hash from codepoint values as refs
-            var refs = codepoints.Select(c => (long)c).ToArray();
-            var mults = Enumerable.Repeat(1, refs.Length).ToArray();
-            var hash = Native.NativeLibrary.ComputeCompositionHash(refs, mults);
-            textToHash[text] = hash;
-        }
+        if (uniqueTexts.Length == 0) return result;
 
-        // Load existing compositions by content hash
-        var existingCompositions = await Context.Compositions
-            .Where(c => c.ContentHash != null)
-            .Select(c => new { c.Id, c.ContentHash })
-            .ToListAsync(ct);
-
-        // Build lookup by converting byte[] to hex string for comparison
-        var hashToCompositionId = existingCompositions
-            .ToDictionary(c => Convert.ToHexString(c.ContentHash), c => c.Id);
-
-        foreach (var (text, hash) in textToHash)
-        {
-            var hashHex = Convert.ToHexString(hash);
-            if (hashToCompositionId.TryGetValue(hashHex, out var compositionId))
-            {
-                result[text] = compositionId;
-            }
-        }
-
-        // Find missing texts
-        var missingTexts = texts.Distinct().Where(t => !result.ContainsKey(t)).ToArray();
-
-        if (missingTexts.Length == 0) return result;
-
-        Logger?.LogDebug("Creating {Count} new token compositions", missingTexts.Length);
-
-        // For missing texts, we need to create compositions
-        // First ensure all codepoints exist as constants
+        // First, collect all unique codepoints across all texts
         var allCodepoints = new HashSet<uint>();
-        foreach (var text in missingTexts)
-        {
-            for (int i = 0; i < text.Length; i++)
-            {
-                if (char.IsHighSurrogate(text[i]) && i + 1 < text.Length && char.IsLowSurrogate(text[i + 1]))
-                {
-                    allCodepoints.Add((uint)char.ConvertToUtf32(text[i], text[i + 1]));
-                    i++;
-                }
-                else
-                {
-                    allCodepoints.Add(text[i]);
-                }
-            }
-        }
-
-        var cpToConstantId = await BulkGetOrCreateCodepointsAsync(allCodepoints.ToArray(), ct);
-
-        // Now create composition for each missing text
-        var newCompositions = new List<(string text, Composition composition, long[] constantIds, int[] mults)>();
-        foreach (var text in missingTexts)
+        var textCodepoints = new Dictionary<string, uint[]>();
+        
+        foreach (var text in uniqueTexts)
         {
             var codepoints = new List<uint>();
             for (int i = 0; i < text.Length; i++)
@@ -512,10 +444,65 @@ public class ModelIngestionService : IngestionServiceBase
                     codepoints.Add(text[i]);
                 }
             }
+            textCodepoints[text] = codepoints.ToArray();
+            foreach (var cp in codepoints) allCodepoints.Add(cp);
+        }
 
+        // Ensure all codepoints exist as constants (this is idempotent)
+        var cpToConstantId = await BulkGetOrCreateCodepointsAsync(allCodepoints.ToArray(), ct);
+
+        // Now compute content hashes using constant IDs (same as what we store)
+        var textToHash = new Dictionary<string, byte[]>();
+        foreach (var text in uniqueTexts)
+        {
+            var codepoints = textCodepoints[text];
             var constantIds = codepoints.Select(cp => cpToConstantId[cp]).ToArray();
             var mults = Enumerable.Repeat(1, constantIds.Length).ToArray();
             var hash = Native.NativeLibrary.ComputeCompositionHash(constantIds, mults);
+            textToHash[text] = hash;
+        }
+
+        // Load existing compositions by content hash
+        var existingCompositions = await Context.Compositions
+            .Where(c => c.ContentHash != null)
+            .Select(c => new { c.Id, c.ContentHash })
+            .ToListAsync(ct);
+
+        // Build lookup by converting byte[] to hex string for comparison
+        var hashToCompositionId = new Dictionary<string, long>();
+        foreach (var c in existingCompositions)
+        {
+            var hex = Convert.ToHexString(c.ContentHash);
+            if (!hashToCompositionId.ContainsKey(hex))
+            {
+                hashToCompositionId[hex] = c.Id;
+            }
+        }
+
+        foreach (var (text, hash) in textToHash)
+        {
+            var hashHex = Convert.ToHexString(hash);
+            if (hashToCompositionId.TryGetValue(hashHex, out var compositionId))
+            {
+                result[text] = compositionId;
+            }
+        }
+
+        // Find missing texts
+        var missingTexts = uniqueTexts.Where(t => !result.ContainsKey(t)).ToArray();
+
+        if (missingTexts.Length == 0) return result;
+
+        Logger?.LogDebug("Creating {Count} new token compositions", missingTexts.Length);
+
+        // Now create composition for each missing text
+        var newCompositions = new List<(string text, Composition composition, long[] constantIds, int[] mults)>();
+        foreach (var text in missingTexts)
+        {
+            var codepoints = textCodepoints[text];
+            var constantIds = codepoints.Select(cp => cpToConstantId[cp]).ToArray();
+            var mults = Enumerable.Repeat(1, constantIds.Length).ToArray();
+            var hash = textToHash[text]; // Reuse already computed hash
 
             // Compute geometry from first char
             var firstCp = codepoints.FirstOrDefault();

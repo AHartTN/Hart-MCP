@@ -12,7 +12,7 @@ extern "C" {
 // HilbertIndex is now defined in types.h
 
 // Configuration
-#define HILBERT_BITS_PER_DIM 16  // 16 bits per dimension = 64 total bits
+#define HILBERT_BITS_PER_DIM 32  // 32 bits per dimension = 128 total bits
 #define HILBERT_DIMENSIONS 4
 
 // Forward transform: 4D coordinates → Hilbert index

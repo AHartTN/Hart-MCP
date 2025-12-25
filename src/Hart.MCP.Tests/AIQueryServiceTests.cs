@@ -174,7 +174,7 @@ public class AIQueryServiceTests : IDisposable
         // When/Then: querying non-existent constant should throw
         var action = () => _service.ComputeAttentionAsync(999, new long[] { 1, 2 });
         await action.Should().ThrowAsync<InvalidOperationException>()
-            .WithMessage("*Query atom 999 not found*");
+            .WithMessage("*Query constant 999 not found*");
     }
 
     [Fact]

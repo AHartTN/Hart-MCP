@@ -18,7 +18,7 @@ public class Constant
 
     /// <summary>
     /// Type discriminator for seed interpretation.
-    /// 1 = Unicode codepoint, 2 = byte, 3 = float32 bits, 4 = integer, etc.
+    /// 0 = Unicode codepoint, 1 = byte, 2 = float32 bits, 3 = integer, etc.
     /// </summary>
     public int SeedType { get; set; }
 
