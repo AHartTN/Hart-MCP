@@ -388,7 +388,7 @@ public class HierarchicalTextIngestionService
             ? _geometryFactory.CreatePoint(coordinates[0])
             : _geometryFactory.CreateLineString(coordinates.ToArray());
 
-        var centroid = rootGeom.Centroid.Coordinate;
+        var centroid = rootGeom.Centroid?.Coordinate ?? new CoordinateZM(0, 0, 0, 0);
         var hilbert = HartNative.point_to_hilbert(new HartNative.PointZM
         {
             X = centroid.X, Y = centroid.Y,
@@ -569,7 +569,7 @@ public class HierarchicalTextIngestionService
                 _ => _geometryFactory.CreateLineString(coords.ToArray())
             };
 
-            var centroid = geom.Centroid.Coordinate;
+            var centroid = geom.Centroid?.Coordinate ?? new CoordinateZM(0, 0, 0, 0);
             var hilbert = HartNative.point_to_hilbert(new HartNative.PointZM
             {
                 X = centroid.X, Y = centroid.Y,
@@ -752,7 +752,7 @@ public class HierarchicalTextIngestionService
             geom = _geometryFactory.CreateLineString(coordinates.ToArray());
         }
 
-        var centroid = geom.Centroid.Coordinate;
+        var centroid = geom.Centroid?.Coordinate ?? new CoordinateZM(0, 0, 0, 0);
         var hilbert = HartNative.point_to_hilbert(new HartNative.PointZM
         {
             X = centroid.X,
@@ -915,7 +915,7 @@ public class HierarchicalTextIngestionService
     /// </summary>
     private static CoordinateZM ExtractRepresentativeCoordinate(Geometry geom)
     {
-        var coord = geom.Centroid.Coordinate;
+        var coord = geom.Centroid?.Coordinate ?? new CoordinateZM(0, 0, 0, 0);
         return new CoordinateZM(
             coord.X,
             coord.Y,

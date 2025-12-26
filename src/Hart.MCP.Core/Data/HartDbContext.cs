@@ -1,5 +1,6 @@
 using Hart.MCP.Core.Entities;
 using Microsoft.EntityFrameworkCore;
+using Microsoft.EntityFrameworkCore.Storage.ValueConversion;
 
 namespace Hart.MCP.Core.Data;
 
@@ -9,6 +10,10 @@ namespace Hart.MCP.Core.Data;
 /// </summary>
 public class HartDbContext : DbContext
 {
+    // Value converter for ulong <-> long (PostgreSQL bigint is signed)
+    private static readonly ValueConverter<ulong, long> UlongToLongConverter =
+        new(v => unchecked((long)v), v => unchecked((ulong)v));
+
     public HartDbContext(DbContextOptions<HartDbContext> options) : base(options)
     {
     }
@@ -49,10 +54,12 @@ public class HartDbContext : DbContext
 
             entity.Property(e => e.HilbertHigh)
                 .HasColumnName("hilbert_high")
+                .HasConversion(UlongToLongConverter)
                 .IsRequired();
 
             entity.Property(e => e.HilbertLow)
                 .HasColumnName("hilbert_low")
+                .HasConversion(UlongToLongConverter)
                 .IsRequired();
 
             entity.Property(e => e.Geom)
@@ -89,10 +96,12 @@ public class HartDbContext : DbContext
 
             entity.Property(e => e.HilbertHigh)
                 .HasColumnName("hilbert_high")
+                .HasConversion(UlongToLongConverter)
                 .IsRequired();
 
             entity.Property(e => e.HilbertLow)
                 .HasColumnName("hilbert_low")
+                .HasConversion(UlongToLongConverter)
                 .IsRequired();
 
             entity.Property(e => e.Geom)
