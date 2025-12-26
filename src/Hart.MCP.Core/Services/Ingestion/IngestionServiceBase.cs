@@ -58,7 +58,7 @@ public abstract class IngestionServiceBase
         
         // Get base hash from native library
         var childIds = children.Select(c => c.id).ToArray();
-        var baseHash = NativeLibrary.ComputeCompositionHash(childIds, multiplicities);
+        var baseHash = HartNative.ComputeCompositionHash(childIds, multiplicities);
         
         // Add child type indicators to make hash unique based on constant vs composition
         // Each child contributes 1 bit: 0 = composition, 1 = constant
@@ -86,7 +86,7 @@ public abstract class IngestionServiceBase
         int seedType,
         CancellationToken ct = default)
     {
-        var baseHash = NativeLibrary.ComputeSeedHash((uint)seedValue);
+        var baseHash = HartNative.ComputeSeedHash((uint)seedValue);
         var contentHash = ComputeTypedContentHash(baseHash, seedType);
 
         var existing = await Context.Constants
@@ -96,8 +96,8 @@ public abstract class IngestionServiceBase
 
         if (existing != 0) return existing;
 
-        var point = NativeLibrary.project_seed_to_hypersphere((uint)seedValue);
-        var hilbert = NativeLibrary.point_to_hilbert(point);
+        var point = HartNative.project_seed_to_hypersphere((uint)seedValue);
+        var hilbert = HartNative.point_to_hilbert(point);
         var geom = GeometryFactory.CreatePoint(new CoordinateZM(point.X, point.Y, point.Z, point.M));
 
         var constant = new Constant
@@ -242,7 +242,7 @@ public abstract class IngestionServiceBase
     /// <summary>
     /// Compute geometry for a composition from its children.
     /// </summary>
-    private async Task<(NativeLibrary.HilbertIndex hilbert, Geometry geom)> ComputeCompositionGeometryAsync(
+    private async Task<(HartNative.HilbertIndex hilbert, Geometry geom)> ComputeCompositionGeometryAsync(
         (long id, bool isConstant)[] children,
         CancellationToken ct)
     {
@@ -270,7 +270,7 @@ public abstract class IngestionServiceBase
         if (allGeoms.Count == 0)
         {
             var defaultPoint = GeometryFactory.CreatePoint(new CoordinateZM(0, 0, 0, 0));
-            var defaultHilbert = NativeLibrary.point_to_hilbert(new NativeLibrary.PointZM { X = 0, Y = 0, Z = 0, M = 0 });
+            var defaultHilbert = HartNative.point_to_hilbert(new HartNative.PointZM { X = 0, Y = 0, Z = 0, M = 0 });
             return (defaultHilbert, defaultPoint);
         }
 
@@ -291,7 +291,7 @@ public abstract class IngestionServiceBase
         avgM /= allGeoms.Count;
 
         var centroid = GeometryFactory.CreatePoint(new CoordinateZM(avgX, avgY, avgZ, avgM));
-        var hilbert = NativeLibrary.point_to_hilbert(new NativeLibrary.PointZM
+        var hilbert = HartNative.point_to_hilbert(new HartNative.PointZM
         {
             X = avgX, Y = avgY, Z = avgZ, M = avgM
         });

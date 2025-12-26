@@ -57,7 +57,7 @@ public class VisualizationController : ControllerBase
 
             var coord = new CoordinateZM(centerX, centerY, centerZ, DateTime.UtcNow.Ticks / TimeSpan.TicksPerSecond);
             var geom = _geometryFactory.CreatePoint(coord);
-            var hilbert = NativeLibrary.point_to_hilbert(new NativeLibrary.PointZM
+            var hilbert = HartNative.point_to_hilbert(new HartNative.PointZM
             {
                 X = coord.X, Y = coord.Y, Z = coord.Z, M = coord.M
             });
@@ -67,7 +67,7 @@ public class VisualizationController : ControllerBase
                 HilbertHigh = (ulong)hilbert.High,
                 HilbertLow = (ulong)hilbert.Low,
                 Geom = geom,
-                ContentHash = NativeLibrary.ComputeCompositionHash(Array.Empty<long>(), Array.Empty<int>())
+                ContentHash = HartNative.ComputeCompositionHash(Array.Empty<long>(), Array.Empty<int>())
             };
 
             _context.Compositions.Add(viewComposition);
@@ -137,7 +137,7 @@ public class VisualizationController : ControllerBase
             );
 
             var geom = _geometryFactory.CreatePoint(coord);
-            var hilbert = NativeLibrary.point_to_hilbert(new NativeLibrary.PointZM
+            var hilbert = HartNative.point_to_hilbert(new HartNative.PointZM
             {
                 X = coord.X, Y = coord.Y, Z = coord.Z, M = coord.M
             });
@@ -147,7 +147,7 @@ public class VisualizationController : ControllerBase
                 HilbertHigh = (ulong)hilbert.High,
                 HilbertLow = (ulong)hilbert.Low,
                 Geom = geom,
-                ContentHash = NativeLibrary.ComputeCompositionHash(Array.Empty<long>(), Array.Empty<int>())
+                ContentHash = HartNative.ComputeCompositionHash(Array.Empty<long>(), Array.Empty<int>())
             };
 
             _context.Compositions.Add(bookmarkComposition);

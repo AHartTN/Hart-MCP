@@ -9,8 +9,6 @@ using Microsoft.EntityFrameworkCore;
 using Microsoft.Extensions.Logging;
 using NetTopologySuite.Geometries;
 
-// Alias to avoid ambiguity with System.Runtime.InteropServices.NativeLibrary
-using HartNative = Hart.MCP.Core.Native.NativeLibrary;
 
 namespace Hart.MCP.Core.Services.Ingestion;
 

@@ -123,7 +123,10 @@ public class HierarchicalTextIngestionService
         // ============================================
         // PHASE 2: In-memory Sequitur grammar induction (NO DB CALLS)
         // ============================================
+        var sequiturWatch = System.Diagnostics.Stopwatch.StartNew();
         var (finalSequence, rules) = ApplySequiturInMemory(codepoints, cancellationToken);
+        sequiturWatch.Stop();
+        _logger?.LogInformation("Sequitur in-memory: {Time}ms", sequiturWatch.ElapsedMilliseconds);
 
         result.TotalPatternsDiscovered = rules.Count;
         result.TierCount = rules.Count > 0 ? rules.Max(r => r.Tier) + 1 : 1;
@@ -135,8 +138,11 @@ public class HierarchicalTextIngestionService
         // ============================================
         // PHASE 3: Batch persist to database
         // ============================================
+        var persistWatch = System.Diagnostics.Stopwatch.StartNew();
         var (rootAtomId, rootIsConstant) = await BatchPersistGrammarAsync(
             codepoints, uniqueCodepoints, finalSequence, rules, cancellationToken);
+        persistWatch.Stop();
+        _logger?.LogInformation("DB persist: {Time}ms", persistWatch.ElapsedMilliseconds);
 
         result.RootAtomId = rootAtomId;
         result.RootIsConstant = rootIsConstant;
@@ -383,7 +389,7 @@ public class HierarchicalTextIngestionService
             : _geometryFactory.CreateLineString(coordinates.ToArray());
 
         var centroid = rootGeom.Centroid.Coordinate;
-        var hilbert = NativeLibrary.point_to_hilbert(new NativeLibrary.PointZM
+        var hilbert = HartNative.point_to_hilbert(new HartNative.PointZM
         {
             X = centroid.X, Y = centroid.Y,
             Z = double.IsNaN(centroid.Z) ? 0 : centroid.Z,
@@ -401,9 +407,29 @@ public class HierarchicalTextIngestionService
         _context.Compositions.Add(rootComposition);
         await _context.SaveChangesAsync(cancellationToken);
 
-        // Create relations using PostgreSQL COPY for massive speedup
-        await BulkCopyRelationsAsync(
-            rootComposition.Id, rootRefs, rootMults, rootIsConstantFlags, cancellationToken);
+        // Create relations - use COPY for PostgreSQL, fallback for in-memory
+        if (_context.Database.IsRelational())
+        {
+            await BulkCopyRelationsAsync(
+                rootComposition.Id, rootRefs, rootMults, rootIsConstantFlags, cancellationToken);
+        }
+        else
+        {
+            // Fallback for in-memory database (tests)
+            for (int i = 0; i < rootRefs.Count; i++)
+            {
+                var rel = new Relation
+                {
+                    CompositionId = rootComposition.Id,
+                    Position = i,
+                    Multiplicity = rootMults[i],
+                    ChildConstantId = rootIsConstantFlags[i] ? rootRefs[i] : null,
+                    ChildCompositionId = rootIsConstantFlags[i] ? null : rootRefs[i]
+                };
+                _context.Relations.Add(rel);
+            }
+            await _context.SaveChangesAsync(cancellationToken);
+        }
 
         return (rootComposition.Id, false);
     }
@@ -544,7 +570,7 @@ public class HierarchicalTextIngestionService
             };
 
             var centroid = geom.Centroid.Coordinate;
-            var hilbert = NativeLibrary.point_to_hilbert(new NativeLibrary.PointZM
+            var hilbert = HartNative.point_to_hilbert(new HartNative.PointZM
             {
                 X = centroid.X, Y = centroid.Y,
                 Z = double.IsNaN(centroid.Z) ? 0 : centroid.Z,
@@ -727,7 +753,7 @@ public class HierarchicalTextIngestionService
         }
 
         var centroid = geom.Centroid.Coordinate;
-        var hilbert = NativeLibrary.point_to_hilbert(new NativeLibrary.PointZM
+        var hilbert = HartNative.point_to_hilbert(new HartNative.PointZM
         {
             X = centroid.X,
             Y = centroid.Y,
@@ -796,9 +822,9 @@ public class HierarchicalTextIngestionService
             
             foreach (var cp in missing)
             {
-                var contentHash = NativeLibrary.ComputeSeedHash(cp);
-                var point = NativeLibrary.project_seed_to_hypersphere(cp);
-                var hilbert = NativeLibrary.point_to_hilbert(point);
+                var contentHash = HartNative.ComputeSeedHash(cp);
+                var point = HartNative.project_seed_to_hypersphere(cp);
+                var hilbert = HartNative.point_to_hilbert(point);
                 var geom = _geometryFactory.CreatePoint(new CoordinateZM(point.X, point.Y, point.Z, point.M));
 
                 var constant = new Constant
@@ -838,7 +864,7 @@ public class HierarchicalTextIngestionService
         using var sha256 = System.Security.Cryptography.SHA256.Create();
         
         // Get base hash from native library
-        var baseHash = NativeLibrary.ComputeCompositionHash(refs, multiplicities);
+        var baseHash = HartNative.ComputeCompositionHash(refs, multiplicities);
         
         // Add child type indicators to make hash unique based on constant vs composition
         var typeBytes = new byte[(refs.Length + 7) / 8];

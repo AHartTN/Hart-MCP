@@ -145,9 +145,9 @@ public class UnicodeSeedingService
             var codepoint = (uint)(start + i);
             
             // Project to hypersphere
-            var point = NativeLibrary.project_seed_to_hypersphere(codepoint);
-            var hilbert = NativeLibrary.point_to_hilbert(point);
-            var contentHash = NativeLibrary.ComputeSeedHash(codepoint);
+            var point = HartNative.project_seed_to_hypersphere(codepoint);
+            var hilbert = HartNative.point_to_hilbert(point);
+            var contentHash = HartNative.ComputeSeedHash(codepoint);
 
             // Create geometry
             var geom = _geometryFactory.CreatePoint(

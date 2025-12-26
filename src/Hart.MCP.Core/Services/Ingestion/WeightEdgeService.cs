@@ -252,7 +252,7 @@ public class WeightEdgeService : IngestionServiceBase
         CancellationToken ct)
     {
         var childIds = children.Select(c => c.id).ToArray();
-        var contentHash = NativeLibrary.ComputeCompositionHash(childIds, multiplicities);
+        var contentHash = HartNative.ComputeCompositionHash(childIds, multiplicities);
 
         // Check for existing (content-addressed deduplication)
         var existing = await Context.Compositions
@@ -276,7 +276,7 @@ public class WeightEdgeService : IngestionServiceBase
 
         // Hilbert from midpoint
         var midpoint = lineString.Centroid.Coordinate;
-        var hilbert = NativeLibrary.point_to_hilbert(new NativeLibrary.PointZM
+        var hilbert = HartNative.point_to_hilbert(new HartNative.PointZM
         {
             X = midpoint.X,
             Y = midpoint.Y,

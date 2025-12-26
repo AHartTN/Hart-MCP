@@ -53,7 +53,7 @@ public class IngestionController : ControllerBase
             );
 
             var geom = _geometryFactory.CreatePoint(coord);
-            var hilbert = NativeLibrary.point_to_hilbert(new NativeLibrary.PointZM
+            var hilbert = HartNative.point_to_hilbert(new HartNative.PointZM
             {
                 X = coord.X, Y = coord.Y, Z = coord.Z, M = coord.M
             });
@@ -63,7 +63,7 @@ public class IngestionController : ControllerBase
                 HilbertHigh = (ulong)hilbert.High,
                 HilbertLow = (ulong)hilbert.Low,
                 Geom = geom,
-                ContentHash = NativeLibrary.ComputeCompositionHash(Array.Empty<long>(), Array.Empty<int>())
+                ContentHash = HartNative.ComputeCompositionHash(Array.Empty<long>(), Array.Empty<int>())
             };
 
             _context.Compositions.Add(contentComposition);
@@ -193,7 +193,7 @@ public class AnalyticsController : ControllerBase
 
             var coord = new CoordinateZM(0, 0, 0, DateTime.UtcNow.Ticks / TimeSpan.TicksPerSecond);
             var geom = _geometryFactory.CreatePoint(coord);
-            var hilbert = NativeLibrary.point_to_hilbert(new NativeLibrary.PointZM
+            var hilbert = HartNative.point_to_hilbert(new HartNative.PointZM
             {
                 X = coord.X, Y = coord.Y, Z = coord.Z, M = coord.M
             });
@@ -203,7 +203,7 @@ public class AnalyticsController : ControllerBase
                 HilbertHigh = (ulong)hilbert.High,
                 HilbertLow = (ulong)hilbert.Low,
                 Geom = geom,
-                ContentHash = NativeLibrary.ComputeCompositionHash(Array.Empty<long>(), Array.Empty<int>())
+                ContentHash = HartNative.ComputeCompositionHash(Array.Empty<long>(), Array.Empty<int>())
             };
 
             _context.Compositions.Add(annotationComposition);
@@ -383,3 +383,138 @@ internal class AnnotationMetadata
     public string AnnotationType { get; set; } = "";
     public string? UserId { get; set; }
 }
+
+/// <summary>
+/// Native bulk ingestion controller - C++ backend for performance.
+/// Unicode seeding: 1.1M chars in <3 seconds
+/// Text ingestion: Moby Dick in <3 seconds
+/// SafeTensor: 80MB in <20 seconds
+/// </summary>
+[ApiController]
+[Route("api/native")]
+public class NativeIngestionController : ControllerBase
+{
+    private readonly Hart.MCP.Core.Services.Ingestion.NativeBulkIngestionService _nativeService;
+    private readonly Hart.MCP.Core.Services.HierarchicalTextIngestionService _textService;
+    private readonly ILogger<NativeIngestionController> _logger;
+
+    public NativeIngestionController(
+        Hart.MCP.Core.Services.Ingestion.NativeBulkIngestionService nativeService,
+        Hart.MCP.Core.Services.HierarchicalTextIngestionService textService,
+        ILogger<NativeIngestionController> logger)
+    {
+        _nativeService = nativeService;
+        _textService = textService;
+        _logger = logger;
+    }
+
+    /// <summary>
+    /// Seed all Unicode codepoints (1.1M) via native C++.
+    /// Target: < 3 seconds.
+    /// </summary>
+    [HttpPost("seed-unicode")]
+    public async Task<ActionResult<ApiResponse<UnicodeSeedResult>>> SeedUnicode([FromQuery] bool fullUnicode = true)
+    {
+        var sw = System.Diagnostics.Stopwatch.StartNew();
+        try
+        {
+            var count = await _nativeService.SeedUnicodeAsync(fullUnicode);
+            sw.Stop();
+
+            return Ok(new ApiResponse<UnicodeSeedResult>
+            {
+                Success = true,
+                Data = new UnicodeSeedResult
+                {
+                    CodepointsSeeded = count,
+                    ElapsedMs = sw.ElapsedMilliseconds
+                }
+            });
+        }
+        catch (Exception ex)
+        {
+            _logger.LogError(ex, "Unicode seeding failed");
+            return BadRequest(new ApiResponse<UnicodeSeedResult> { Success = false, Error = ex.Message });
+        }
+    }
+
+    /// <summary>
+    /// Ingest text via native C++ Sequitur.
+    /// Target: Moby Dick in < 3 seconds.
+    /// </summary>
+    [HttpPost("ingest-text")]
+    public async Task<ActionResult<ApiResponse<TextIngestionResult>>> IngestText([FromBody] TextIngestionRequest request)
+    {
+        var sw = System.Diagnostics.Stopwatch.StartNew();
+        try
+        {
+            var result = await _textService.IngestTextHierarchicallyAsync(request.Text);
+            var rootId = result.RootAtomId;
+            sw.Stop();
+
+            return Ok(new ApiResponse<TextIngestionResult>
+            {
+                Success = true,
+                Data = new TextIngestionResult
+                {
+                    RootCompositionId = rootId,
+                    TextLength = request.Text.Length,
+                    ElapsedMs = sw.ElapsedMilliseconds
+                }
+            });
+        }
+        catch (Exception ex)
+        {
+            _logger.LogError(ex, "Text ingestion failed");
+            return BadRequest(new ApiResponse<TextIngestionResult> { Success = false, Error = ex.Message });
+        }
+    }
+
+    /// <summary>
+    /// Ingest SafeTensor file via native C++.
+    /// Target: 80MB in < 20 seconds.
+    /// </summary>
+    [HttpPost("ingest-safetensor")]
+    public async Task<ActionResult<ApiResponse<Hart.MCP.Core.Services.Ingestion.SafeTensorIngestionResult>>> IngestSafeTensor(
+        [FromQuery] string filePath,
+        [FromQuery] string modelName,
+        [FromQuery] float targetSparsity = 25.0f)
+    {
+        var sw = System.Diagnostics.Stopwatch.StartNew();
+        try
+        {
+            var result = await _nativeService.IngestSafeTensorAsync(filePath, modelName, targetSparsity);
+            sw.Stop();
+
+            return Ok(new ApiResponse<Hart.MCP.Core.Services.Ingestion.SafeTensorIngestionResult>
+            {
+                Success = true,
+                Data = result
+            });
+        }
+        catch (Exception ex)
+        {
+            _logger.LogError(ex, "SafeTensor ingestion failed");
+            return BadRequest(new ApiResponse<Hart.MCP.Core.Services.Ingestion.SafeTensorIngestionResult>
+            {
+                Success = false,
+                Error = ex.Message
+            });
+        }
+    }
+}
+
+public class UnicodeSeedResult
+{
+    public long CodepointsSeeded { get; set; }
+    public long ElapsedMs { get; set; }
+}
+
+public class TextIngestionResult
+{
+    public long RootCompositionId { get; set; }
+    public int TextLength { get; set; }
+    public long ElapsedMs { get; set; }
+}
+
+public record TextIngestionRequest(string Text);

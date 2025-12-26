@@ -139,9 +139,9 @@ public class AtomIngestionService
             
             foreach (var cp in missingCodepoints)
             {
-                var contentHash = NativeLibrary.ComputeSeedHash(cp);
-                var point = NativeLibrary.project_seed_to_hypersphere(cp);
-                var hilbert = NativeLibrary.point_to_hilbert(point);
+                var contentHash = HartNative.ComputeSeedHash(cp);
+                var point = HartNative.project_seed_to_hypersphere(cp);
+                var hilbert = HartNative.point_to_hilbert(point);
                 var geom = _geometryFactory.CreatePoint(new CoordinateZM(point.X, point.Y, point.Z, point.M));
 
                 var constant = new Constant
@@ -207,7 +207,7 @@ public class AtomIngestionService
     public async Task<long> GetOrCreateConstantAsync(uint codepoint, CancellationToken cancellationToken = default)
     {
         // Compute deterministic hash
-        var contentHash = NativeLibrary.ComputeSeedHash(codepoint);
+        var contentHash = HartNative.ComputeSeedHash(codepoint);
 
         // Check if already exists (deduplication)
         var existing = await _context.Constants
@@ -219,8 +219,8 @@ public class AtomIngestionService
             return existing;
 
         // Project to hypersphere
-        var point = NativeLibrary.project_seed_to_hypersphere(codepoint);
-        var hilbert = NativeLibrary.point_to_hilbert(point);
+        var point = HartNative.project_seed_to_hypersphere(codepoint);
+        var hilbert = HartNative.point_to_hilbert(point);
 
         // Create geometry (POINTZM)
         var geom = _geometryFactory.CreatePoint(
@@ -278,7 +278,7 @@ public class AtomIngestionService
             throw new ArgumentException("Multiplicities must match constantIds length", nameof(multiplicities));
 
         // Compute deterministic hash
-        var contentHash = NativeLibrary.ComputeCompositionHash(constantIds, multiplicities);
+        var contentHash = HartNative.ComputeCompositionHash(constantIds, multiplicities);
 
         // Check if already exists (deduplication)
         var existing = await _context.Compositions
@@ -318,7 +318,7 @@ public class AtomIngestionService
 
         // Compute Hilbert index from centroid
         var centroid = geom.Centroid.Coordinate;
-        var hilbert = NativeLibrary.point_to_hilbert(new NativeLibrary.PointZM
+        var hilbert = HartNative.point_to_hilbert(new HartNative.PointZM
         {
             X = centroid.X,
             Y = centroid.Y,
@@ -390,7 +390,7 @@ public class AtomIngestionService
             throw new ArgumentException("Multiplicities must match compositionIds length", nameof(multiplicities));
 
         // Compute deterministic hash
-        var contentHash = NativeLibrary.ComputeCompositionHash(compositionIds, multiplicities);
+        var contentHash = HartNative.ComputeCompositionHash(compositionIds, multiplicities);
 
         // Check if already exists (deduplication)
         var existing = await _context.Compositions
@@ -430,7 +430,7 @@ public class AtomIngestionService
 
         // Compute Hilbert index from centroid
         var centroid = geom.Centroid.Coordinate;
-        var hilbert = NativeLibrary.point_to_hilbert(new NativeLibrary.PointZM
+        var hilbert = HartNative.point_to_hilbert(new HartNative.PointZM
         {
             X = centroid.X,
             Y = centroid.Y,

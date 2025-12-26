@@ -43,8 +43,8 @@
 #include <omp.h>
 #endif
 
-// Batch size for COPY operations
-static constexpr size_t COPY_BATCH_SIZE = 50000;
+// Batch size for COPY operations - larger = fewer round trips
+static constexpr size_t COPY_BATCH_SIZE = 500000;
 
 // SafeTensor header structure
 struct SafeTensorHeader {
@@ -58,16 +58,14 @@ struct TensorInfo {
     int64_t total_elements;
 };
 
-// Atom data for bulk insert
-struct AtomData {
+// Constant data for bulk insert (new three-table schema)
+struct ConstantData {
     int64_t hilbert_high;
     int64_t hilbert_low;
     double x, y, z, m;
     ContentHash hash;
-    bool is_constant;
-    uint32_t seed_value;
+    int64_t seed_value;
     int32_t seed_type;
-    std::string atom_type;
 };
 
 // Helper: Convert 64-bit int to network byte order
@@ -183,170 +181,40 @@ static bool parse_safetensor_header(FILE* fp, SafeTensorHeader& header, int64_t&
     return true;
 }
 
-// Begin COPY for atom table
-static bool begin_copy(PGconn* conn) {
-    const char* sql = 
-        "COPY atom (hilbert_high, hilbert_low, geom, is_constant, seed_value, seed_type, content_hash, atom_type) "
+// Write EWKB PointZM to buffer (PostGIS binary format) - returns bytes written
+static size_t write_ewkb_pointzm(uint8_t* buf, double x, double y, double z, double m) {
+    size_t pos = 0;
+
+    // Byte order: 1 = little-endian
+    buf[pos++] = 0x01;
+
+    // Type: PointZM with SRID = 0xC0000001 (little-endian)
+    // 0x00000001 = Point, 0x80000000 = hasZ, 0x40000000 = hasM
+    uint32_t type = 0xC0000001;
+    memcpy(buf + pos, &type, 4); pos += 4;
+
+    // SRID = 0
+    uint32_t srid = 0;
+    memcpy(buf + pos, &srid, 4); pos += 4;
+
+    // Coordinates (little-endian doubles)
+    memcpy(buf + pos, &x, 8); pos += 8;
+    memcpy(buf + pos, &y, 8); pos += 8;
+    memcpy(buf + pos, &z, 8); pos += 8;
+    memcpy(buf + pos, &m, 8); pos += 8;
+
+    return pos;  // 41 bytes total
+}
+
+// Bulk insert constants using COPY BINARY (maximum speed)
+static int64_t bulk_insert_constants(PGconn* conn, const std::vector<ConstantData>& constants) {
+    if (constants.empty()) return 0;
+
+    // COPY BINARY to constant table
+    const char* sql =
+        "COPY constant (seed_value, seed_type, content_hash, hilbert_high, hilbert_low, geom) "
         "FROM STDIN WITH (FORMAT binary)";
-    
-    PGresult* res = PQexec(conn, sql);
-    if (PQresultStatus(res) != PGRES_COPY_IN) {
-        fprintf(stderr, "COPY start failed: %s\n", PQerrorMessage(conn));
-        PQclear(res);
-        return false;
-    }
-    PQclear(res);
-    
-    // Write COPY binary header
-    // Signature: "PGCOPY\n\377\r\n\0"
-    const char header[] = "PGCOPY\n\377\r\n\0";
-    uint32_t flags = 0;
-    uint32_t header_ext_len = 0;
-    
-    std::vector<uint8_t> hdr_buf;
-    hdr_buf.insert(hdr_buf.end(), header, header + 11);
-    
-    uint8_t flags_buf[4];
-    write_int32_be(flags_buf, flags);
-    hdr_buf.insert(hdr_buf.end(), flags_buf, flags_buf + 4);
-    
-    uint8_t ext_buf[4];
-    write_int32_be(ext_buf, header_ext_len);
-    hdr_buf.insert(hdr_buf.end(), ext_buf, ext_buf + 4);
-    
-    if (PQputCopyData(conn, (const char*)hdr_buf.data(), (int)hdr_buf.size()) != 1) {
-        fprintf(stderr, "COPY header write failed: %s\n", PQerrorMessage(conn));
-        return false;
-    }
-    
-    return true;
-}
 
-// Write a single atom row in COPY binary format
-static bool write_atom_row(PGconn* conn, const AtomData& atom) {
-    std::vector<uint8_t> row;
-    
-    // Field count (8 fields)
-    uint8_t field_count[2];
-    field_count[0] = 0;
-    field_count[1] = 8;
-    row.insert(row.end(), field_count, field_count + 2);
-    
-    // Field 1: hilbert_high (int64)
-    uint8_t len8[4];
-    write_int32_be(len8, 8);
-    row.insert(row.end(), len8, len8 + 4);
-    uint8_t val8[8];
-    write_int64_be(val8, atom.hilbert_high);
-    row.insert(row.end(), val8, val8 + 8);
-    
-    // Field 2: hilbert_low (int64)
-    row.insert(row.end(), len8, len8 + 4);
-    write_int64_be(val8, atom.hilbert_low);
-    row.insert(row.end(), val8, val8 + 8);
-    
-    // Field 3: geom (PostGIS EWKB)
-    // For PointZM, we use WKT via ST_GeomFromText
-    // Actually, for COPY we need raw geometry bytes
-    // Use PostGIS internal format (EWKB)
-    std::string wkt = point_to_wkt(atom.x, atom.y, atom.z, atom.m);
-    
-    // EWKB for PointZM (SRID=0):
-    // 1 byte: byte order (01 = little endian)
-    // 4 bytes: type (0xC0000001 = PointZM with SRID)
-    // Actually simpler: use text format for geometry column
-    // For now, write as text and let PostGIS parse
-    uint8_t wkt_len[4];
-    write_int32_be(wkt_len, (int32_t)wkt.length());
-    row.insert(row.end(), wkt_len, wkt_len + 4);
-    row.insert(row.end(), wkt.begin(), wkt.end());
-    
-    // Field 4: is_constant (bool)
-    uint8_t len1[4];
-    write_int32_be(len1, 1);
-    row.insert(row.end(), len1, len1 + 4);
-    row.push_back(atom.is_constant ? 1 : 0);
-    
-    // Field 5: seed_value (int64, nullable)
-    if (atom.is_constant) {
-        row.insert(row.end(), len8, len8 + 4);
-        write_int64_be(val8, atom.seed_value);
-        row.insert(row.end(), val8, val8 + 8);
-    } else {
-        // NULL
-        uint8_t null_marker[4];
-        write_int32_be(null_marker, -1);
-        row.insert(row.end(), null_marker, null_marker + 4);
-    }
-    
-    // Field 6: seed_type (int32, nullable)
-    if (atom.is_constant) {
-        uint8_t len4[4];
-        write_int32_be(len4, 4);
-        row.insert(row.end(), len4, len4 + 4);
-        uint8_t val4[4];
-        write_int32_be(val4, atom.seed_type);
-        row.insert(row.end(), val4, val4 + 4);
-    } else {
-        uint8_t null_marker[4];
-        write_int32_be(null_marker, -1);
-        row.insert(row.end(), null_marker, null_marker + 4);
-    }
-    
-    // Field 7: content_hash (bytea, 32 bytes)
-    uint8_t len32[4];
-    write_int32_be(len32, 32);
-    row.insert(row.end(), len32, len32 + 4);
-    row.insert(row.end(), atom.hash.bytes, atom.hash.bytes + 32);
-    
-    // Field 8: atom_type (text)
-    uint8_t type_len[4];
-    write_int32_be(type_len, (int32_t)atom.atom_type.length());
-    row.insert(row.end(), type_len, type_len + 4);
-    row.insert(row.end(), atom.atom_type.begin(), atom.atom_type.end());
-    
-    if (PQputCopyData(conn, (const char*)row.data(), (int)row.size()) != 1) {
-        return false;
-    }
-    
-    return true;
-}
-
-// End COPY operation
-static bool end_copy(PGconn* conn) {
-    // Write trailer (-1 as int16)
-    uint8_t trailer[2] = {0xFF, 0xFF};
-    if (PQputCopyData(conn, (const char*)trailer, 2) != 1) {
-        fprintf(stderr, "COPY trailer write failed: %s\n", PQerrorMessage(conn));
-        return false;
-    }
-    
-    if (PQputCopyEnd(conn, nullptr) != 1) {
-        fprintf(stderr, "COPY end failed: %s\n", PQerrorMessage(conn));
-        return false;
-    }
-    
-    PGresult* res = PQgetResult(conn);
-    if (PQresultStatus(res) != PGRES_COMMAND_OK) {
-        fprintf(stderr, "COPY result failed: %s\n", PQerrorMessage(conn));
-        PQclear(res);
-        return false;
-    }
-    PQclear(res);
-    
-    return true;
-}
-
-// Bulk insert atoms using COPY
-static int64_t bulk_insert_atoms(PGconn* conn, const std::vector<AtomData>& atoms) {
-    if (atoms.empty()) return 0;
-    
-    // Use text-based COPY for simplicity with geometry
-    // This is still much faster than individual INSERTs
-    const char* sql = 
-        "COPY atom (hilbert_high, hilbert_low, geom, is_constant, seed_value, seed_type, content_hash, atom_type) "
-        "FROM STDIN WITH (FORMAT text, NULL 'NULL')";
-    
     PGresult* res = PQexec(conn, sql);
     if (PQresultStatus(res) != PGRES_COPY_IN) {
         fprintf(stderr, "COPY start failed: %s\n", PQerrorMessage(conn));
@@ -354,51 +222,88 @@ static int64_t bulk_insert_atoms(PGconn* conn, const std::vector<AtomData>& atom
         return -1;
     }
     PQclear(res);
-    
+
+    // Binary COPY header: "PGCOPY\n\377\r\n\0" + flags (4 bytes) + extension (4 bytes)
+    uint8_t header[19] = {'P','G','C','O','P','Y','\n',0xFF,'\r','\n',0x00, 0,0,0,0, 0,0,0,0};
+    if (PQputCopyData(conn, (const char*)header, 19) != 1) {
+        PQputCopyEnd(conn, "header failed");
+        return -1;
+    }
+
+    // Pre-allocate large batch buffer (16MB) to minimize PQputCopyData calls
+    const size_t ROW_SIZE = 128;
+    const size_t BUFFER_SIZE = 16 * 1024 * 1024;  // 16MB
+    std::vector<uint8_t> batch_buf(BUFFER_SIZE);
+    size_t batch_pos = 0;
+
     int64_t count = 0;
-    for (const auto& atom : atoms) {
-        std::string wkt = point_to_wkt(atom.x, atom.y, atom.z, atom.m);
-        
-        // Convert hash to hex
-        char hash_hex[65];
-        for (int i = 0; i < 32; i++) {
-            sprintf(hash_hex + i * 2, "%02x", atom.hash.bytes[i]);
+    for (const auto& c : constants) {
+        // Check if we need to flush batch
+        if (batch_pos + ROW_SIZE > BUFFER_SIZE) {
+            if (PQputCopyData(conn, (const char*)batch_buf.data(), (int)batch_pos) != 1) {
+                fprintf(stderr, "COPY batch write failed: %s\n", PQerrorMessage(conn));
+                PQputCopyEnd(conn, "error");
+                return -1;
+            }
+            batch_pos = 0;
         }
-        hash_hex[64] = '\0';
-        
-        // Build row
-        char row[1024];
-        if (atom.is_constant) {
-            snprintf(row, sizeof(row), "%lld\t%lld\tSRID=0;%s\tt\t%u\t%d\t\\\\x%s\t%s\n",
-                (long long)atom.hilbert_high,
-                (long long)atom.hilbert_low,
-                wkt.c_str(),
-                atom.seed_value,
-                atom.seed_type,
-                hash_hex,
-                atom.atom_type.c_str());
-        } else {
-            snprintf(row, sizeof(row), "%lld\t%lld\tSRID=0;%s\tf\tNULL\tNULL\t\\\\x%s\t%s\n",
-                (long long)atom.hilbert_high,
-                (long long)atom.hilbert_low,
-                wkt.c_str(),
-                hash_hex,
-                atom.atom_type.c_str());
-        }
-        
-        if (PQputCopyData(conn, row, (int)strlen(row)) != 1) {
-            fprintf(stderr, "COPY data write failed: %s\n", PQerrorMessage(conn));
+
+        uint8_t* row = batch_buf.data() + batch_pos;
+        size_t pos = 0;
+
+        // Field count: 6 (big-endian int16)
+        row[pos++] = 0x00;
+        row[pos++] = 0x06;
+
+        // Field 1: seed_value (int64, 8 bytes)
+        write_int32_be(row + pos, 8); pos += 4;
+        write_int64_be(row + pos, c.seed_value); pos += 8;
+
+        // Field 2: seed_type (int32, 4 bytes)
+        write_int32_be(row + pos, 4); pos += 4;
+        write_int32_be(row + pos, c.seed_type); pos += 4;
+
+        // Field 3: content_hash (bytea, 32 bytes)
+        write_int32_be(row + pos, 32); pos += 4;
+        memcpy(row + pos, c.hash.bytes, 32); pos += 32;
+
+        // Field 4: hilbert_high (int64, 8 bytes)
+        write_int32_be(row + pos, 8); pos += 4;
+        write_int64_be(row + pos, c.hilbert_high); pos += 8;
+
+        // Field 5: hilbert_low (int64, 8 bytes)
+        write_int32_be(row + pos, 8); pos += 4;
+        write_int64_be(row + pos, c.hilbert_low); pos += 8;
+
+        // Field 6: geom (EWKB PointZM, 41 bytes)
+        write_int32_be(row + pos, 41); pos += 4;
+        pos += write_ewkb_pointzm(row + pos, c.x, c.y, c.z, c.m);
+
+        batch_pos += pos;
+        count++;
+    }
+
+    // Flush remaining data
+    if (batch_pos > 0) {
+        if (PQputCopyData(conn, (const char*)batch_buf.data(), (int)batch_pos) != 1) {
+            fprintf(stderr, "COPY final batch write failed: %s\n", PQerrorMessage(conn));
             PQputCopyEnd(conn, "error");
             return -1;
         }
-        count++;
     }
-    
+
+    // Binary COPY trailer: -1 (int16)
+    uint8_t trailer[2] = {0xFF, 0xFF};
+    if (PQputCopyData(conn, (const char*)trailer, 2) != 1) {
+        PQputCopyEnd(conn, "trailer failed");
+        return -1;
+    }
+
     if (PQputCopyEnd(conn, nullptr) != 1) {
         fprintf(stderr, "COPY end failed: %s\n", PQerrorMessage(conn));
         return -1;
     }
-    
+
     res = PQgetResult(conn);
     if (PQresultStatus(res) != PGRES_COMMAND_OK) {
         fprintf(stderr, "COPY result failed: %s\n", PQerrorMessage(conn));
@@ -406,7 +311,7 @@ static int64_t bulk_insert_atoms(PGconn* conn, const std::vector<AtomData>& atom
         return -1;
     }
     PQclear(res);
-    
+
     return count;
 }
 
@@ -416,7 +321,7 @@ static std::unordered_set<std::string> lookup_existing_hashes(PGconn* conn, cons
     if (hashes.empty()) return existing;
     
     // Build query with hash array
-    std::string sql = "SELECT encode(content_hash, 'hex') FROM atom WHERE content_hash IN (";
+    std::string sql = "SELECT encode(content_hash, 'hex') FROM constant WHERE content_hash IN (";
     for (size_t i = 0; i < hashes.size(); i++) {
         if (i > 0) sql += ",";
         sql += "'\\x";
@@ -456,70 +361,72 @@ HART_API int64_t hart_seed_unicode(
     void* user_data)
 {
     if (!conn) return HART_ERROR_DB_CONNECTION;
-    
+
     auto start_time = std::chrono::high_resolution_clock::now();
-    
-    int64_t total_created = 0;
-    std::vector<AtomData> batch;
-    batch.reserve(COPY_BATCH_SIZE);
-    
-    uint32_t total = end_codepoint - start_codepoint + 1;
-    
+
+    // Build valid codepoint array (excluding surrogates 0xD800-0xDFFF)
+    std::vector<uint32_t> codepoints;
+    codepoints.reserve(end_codepoint - start_codepoint + 1);
     for (uint32_t cp = start_codepoint; cp <= end_codepoint; cp++) {
-        // Skip surrogates
-        if (cp >= 0xD800 && cp <= 0xDFFF) continue;
-        
-        AtomData atom;
-        atom.is_constant = true;
-        atom.seed_value = cp;
-        atom.seed_type = SEED_UNICODE;
-        atom.atom_type = "codepoint";
-        
+        if (cp < 0xD800 || cp > 0xDFFF) {
+            codepoints.push_back(cp);
+        }
+    }
+    const size_t valid_count = codepoints.size();
+
+    // Pre-allocate full batch for parallel computation
+    std::vector<ConstantData> all_constants(valid_count);
+
+    // PARALLEL COMPUTATION: geometry, hilbert, hash (O(n) now, was O(n²))
+    #ifdef _OPENMP
+    #pragma omp parallel for schedule(static)
+    #endif
+    for (int64_t i = 0; i < (int64_t)valid_count; i++) {
+        uint32_t cp = codepoints[i];  // Direct O(1) lookup
+
+        ConstantData& c = all_constants[i];
+        c.seed_value = cp;
+        c.seed_type = SEED_UNICODE;
+
         // Compute geometry
         AtomSeed seed = seed_from_codepoint(cp);
         Point4D pt = compute_coords_from_seed(&seed);
-        atom.x = pt.x;
-        atom.y = pt.y;
-        atom.z = pt.z;
-        atom.m = pt.m;
-        
+        c.x = pt.x;
+        c.y = pt.y;
+        c.z = pt.z;
+        c.m = pt.m;
+
         // Compute Hilbert index
         HilbertIndex hilbert = coords_to_hilbert(pt.x, pt.y, pt.z, pt.m);
-        atom.hilbert_high = hilbert.high;
-        atom.hilbert_low = hilbert.low;
-        
+        c.hilbert_high = hilbert.high;
+        c.hilbert_low = hilbert.low;
+
         // Compute content hash
-        atom.hash = compute_seed_hash(cp);
-        
-        batch.push_back(atom);
-        
-        if (batch.size() >= COPY_BATCH_SIZE) {
-            int64_t inserted = bulk_insert_atoms(conn, batch);
-            if (inserted < 0) return inserted;
-            total_created += inserted;
-            batch.clear();
-            
-            if (progress_callback) {
-                double pct = 100.0 * (cp - start_codepoint) / total;
-                progress_callback("Unicode seeding", cp - start_codepoint, total, total_created, 0, user_data);
-            }
-        }
+        c.hash = compute_seed_hash(cp);
     }
-    
-    // Final batch
-    if (!batch.empty()) {
-        int64_t inserted = bulk_insert_atoms(conn, batch);
+
+    // SEQUENTIAL DB INSERT: batch COPY
+    int64_t total_created = 0;
+    for (size_t offset = 0; offset < all_constants.size(); offset += COPY_BATCH_SIZE) {
+        size_t batch_size = std::min(COPY_BATCH_SIZE, all_constants.size() - offset);
+        std::vector<ConstantData> batch(
+            all_constants.begin() + offset,
+            all_constants.begin() + offset + batch_size
+        );
+
+        int64_t inserted = bulk_insert_constants(conn, batch);
         if (inserted < 0) return inserted;
         total_created += inserted;
+
+        if (progress_callback) {
+            progress_callback("Unicode seeding", (int32_t)(offset + batch_size), (int32_t)valid_count, total_created, 0, user_data);
+        }
     }
-    
-    auto end_time = std::chrono::high_resolution_clock::now();
-    auto duration = std::chrono::duration_cast<std::chrono::milliseconds>(end_time - start_time);
-    
+
     if (progress_callback) {
-        progress_callback("Complete", total, total, total_created, 0, user_data);
+        progress_callback("Complete", (int32_t)valid_count, (int32_t)valid_count, total_created, 0, user_data);
     }
-    
+
     return total_created;
 }
 
@@ -598,7 +505,7 @@ HART_API HartResult hart_ingest_safetensor(
     
     // Process each tensor
     int32_t tensors_processed = 0;
-    std::vector<AtomData> batch;
+    std::vector<ConstantData> batch;
     batch.reserve(COPY_BATCH_SIZE);
     
     // Track unique float bits and their atom IDs
@@ -673,37 +580,35 @@ HART_API HartResult hart_ingest_safetensor(
                     continue;  // Already processed
                 }
                 
-                // Create atom data
-                AtomData atom;
-                atom.is_constant = true;
-                atom.seed_value = bits;
-                atom.seed_type = SEED_FLOAT_BITS;
-                atom.atom_type = "float32";
-                
+                // Create constant data
+                ConstantData c;
+                c.seed_value = bits;
+                c.seed_type = SEED_FLOAT_BITS;
+
                 // Compute geometry from float bits
                 AtomSeed seed;
                 seed.type = SEED_FLOAT_BITS;
                 seed.value.float_bits = bits;
                 Point4D pt = compute_coords_from_seed(&seed);
-                atom.x = pt.x;
-                atom.y = pt.y;
-                atom.z = pt.z;
-                atom.m = pt.m;
-                
+                c.x = pt.x;
+                c.y = pt.y;
+                c.z = pt.z;
+                c.m = pt.m;
+
                 // Compute Hilbert index
                 HilbertIndex hilbert = coords_to_hilbert(pt.x, pt.y, pt.z, pt.m);
-                atom.hilbert_high = hilbert.high;
-                atom.hilbert_low = hilbert.low;
-                
+                c.hilbert_high = hilbert.high;
+                c.hilbert_low = hilbert.low;
+
                 // Compute content hash
-                atom.hash = compute_seed_hash(bits);
-                
-                batch.push_back(atom);
+                c.hash = compute_seed_hash(bits);
+
+                batch.push_back(c);
                 float_atom_ids[bits] = 0;  // Will be updated after insert
                 
                 // Flush batch if full
                 if (batch.size() >= COPY_BATCH_SIZE) {
-                    int64_t inserted = bulk_insert_atoms(conn, batch);
+                    int64_t inserted = bulk_insert_constants(conn, batch);
                     if (inserted < 0) {
                         fclose(fp);
                         snprintf(result->error_message, sizeof(result->error_message), "Bulk insert failed");
@@ -727,7 +632,7 @@ HART_API HartResult hart_ingest_safetensor(
     
     // Final batch
     if (!batch.empty()) {
-        int64_t inserted = bulk_insert_atoms(conn, batch);
+        int64_t inserted = bulk_insert_constants(conn, batch);
         if (inserted < 0) {
             fclose(fp);
             snprintf(result->error_message, sizeof(result->error_message), "Final bulk insert failed");
@@ -779,7 +684,7 @@ HART_API HartResult hart_batch_lookup_atoms(
     for (size_t offset = 0; offset < count; offset += batch_size) {
         size_t batch_count = std::min(batch_size, count - offset);
         
-        std::string sql = "SELECT content_hash, id FROM atom WHERE content_hash IN (";
+        std::string sql = "SELECT content_hash, id FROM constant WHERE content_hash IN (";
         for (size_t i = 0; i < batch_count; i++) {
             if (i > 0) sql += ",";
             sql += "'\\x";

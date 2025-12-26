@@ -7,7 +7,7 @@ namespace Hart.MCP.Core.Native;
 /// Provides lossless, deterministic operations for seed projection and Hilbert curves
 /// Now includes SIMD-accelerated operations for high-performance batch processing
 /// </summary>
-public static class NativeLibrary
+public static class HartNative
 {
     private const string LibName = "hartonomous_native";
 
@@ -351,6 +351,17 @@ public static class NativeLibrary
     /// </summary>
     [DllImport(LibName, CallingConvention = CallingConvention.Cdecl)]
     public static extern void hart_db_disconnect(IntPtr conn);
+
+    /// <summary>
+    /// Ingest text with Sequitur grammar induction (native C++ implementation).
+    /// Returns root composition ID.
+    /// </summary>
+    [DllImport(LibName, CallingConvention = CallingConvention.Cdecl, CharSet = CharSet.Ansi)]
+    public static extern int hart_ingest_text(
+        IntPtr conn,
+        [MarshalAs(UnmanagedType.LPUTF8Str)] string text,
+        nuint length,
+        out long outAtomId);
 
     #endregion
 }

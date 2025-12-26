@@ -15,12 +15,33 @@
     <PackageReference Include="Npgsql.EntityFrameworkCore.PostgreSQL.NetTopologySuite" Version="10.0.0" />
   </ItemGroup>
 
-  <!-- Native library - copy to output directory -->
+  <!-- Native library and PostgreSQL dependencies - copy to output directory -->
   <ItemGroup>
-    <Content Include="..\Hart.MCP.Native\lib\hartonomous_native.dll" 
+    <Content Include="..\Hart.MCP.Native\lib\hartonomous_native.dll"
              Condition="Exists('..\Hart.MCP.Native\lib\hartonomous_native.dll')">
       <CopyToOutputDirectory>PreserveNewest</CopyToOutputDirectory>
       <Link>hartonomous_native.dll</Link>
+    </Content>
+    <!-- PostgreSQL client library -->
+    <Content Include="D:\PostgreSQL\18\bin\libpq.dll">
+      <CopyToOutputDirectory>PreserveNewest</CopyToOutputDirectory>
+      <Link>libpq.dll</Link>
+    </Content>
+    <Content Include="D:\PostgreSQL\18\bin\libssl-3-x64.dll">
+      <CopyToOutputDirectory>PreserveNewest</CopyToOutputDirectory>
+      <Link>libssl-3-x64.dll</Link>
+    </Content>
+    <Content Include="D:\PostgreSQL\18\bin\libcrypto-3-x64.dll">
+      <CopyToOutputDirectory>PreserveNewest</CopyToOutputDirectory>
+      <Link>libcrypto-3-x64.dll</Link>
+    </Content>
+    <Content Include="D:\PostgreSQL\18\bin\libiconv-2.dll">
+      <CopyToOutputDirectory>PreserveNewest</CopyToOutputDirectory>
+      <Link>libiconv-2.dll</Link>
+    </Content>
+    <Content Include="D:\PostgreSQL\18\bin\libintl-9.dll">
+      <CopyToOutputDirectory>PreserveNewest</CopyToOutputDirectory>
+      <Link>libintl-9.dll</Link>
     </Content>
   </ItemGroup>
 

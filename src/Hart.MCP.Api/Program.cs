@@ -106,6 +106,11 @@ builder.Services.AddScoped<HartDbContext>(sp =>
 builder.Services.AddScoped<AtomIngestionService>();
 builder.Services.AddScoped<SpatialQueryService>();
 builder.Services.AddScoped<AIQueryService>();
+builder.Services.AddScoped<HierarchicalTextIngestionService>();
+
+// Native bulk ingestion (C++ backend for performance)
+builder.Services.AddSingleton(sp =>
+    new NativeBulkIngestionService(connectionString, sp.GetService<ILogger<NativeBulkIngestionService>>()));
 
 // High-performance parallel services (use IDbContextFactory for thread safety)
 builder.Services.AddSingleton<Hart.MCP.Core.Services.Optimized.ParallelIngestionService>();

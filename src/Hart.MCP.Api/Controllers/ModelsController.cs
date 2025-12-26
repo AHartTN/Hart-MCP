@@ -56,7 +56,7 @@ public class ModelsController : ControllerBase
             );
 
             var geom = _geometryFactory.CreatePoint(coord);
-            var hilbert = NativeLibrary.point_to_hilbert(new NativeLibrary.PointZM
+            var hilbert = HartNative.point_to_hilbert(new HartNative.PointZM
             {
                 X = coord.X, Y = coord.Y, Z = coord.Z, M = coord.M
             });
@@ -66,7 +66,7 @@ public class ModelsController : ControllerBase
                 HilbertHigh = (ulong)hilbert.High,
                 HilbertLow = (ulong)hilbert.Low,
                 Geom = geom,
-                ContentHash = NativeLibrary.ComputeCompositionHash(Array.Empty<long>(), Array.Empty<int>())
+                ContentHash = HartNative.ComputeCompositionHash(Array.Empty<long>(), Array.Empty<int>())
             };
 
             _context.Compositions.Add(modelComposition);
@@ -188,7 +188,7 @@ public class ModelsController : ControllerBase
             );
 
             var geom = _geometryFactory.CreatePoint(midpoint);
-            var hilbert = NativeLibrary.point_to_hilbert(new NativeLibrary.PointZM
+            var hilbert = HartNative.point_to_hilbert(new HartNative.PointZM
             {
                 X = midpoint.X, Y = midpoint.Y, Z = midpoint.Z, M = midpoint.M
             });
@@ -198,7 +198,7 @@ public class ModelsController : ControllerBase
                 HilbertHigh = (ulong)hilbert.High,
                 HilbertLow = (ulong)hilbert.Low,
                 Geom = geom,
-                ContentHash = NativeLibrary.ComputeCompositionHash(
+                ContentHash = HartNative.ComputeCompositionHash(
                     new[] { request.Model1Id, request.Model2Id },
                     new[] { 1, 1 })
             };

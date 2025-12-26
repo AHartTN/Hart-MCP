@@ -310,7 +310,7 @@ public class AIQueryService
             if (gapSize > range)
             {
                 // Calculate midpoint coordinates
-                var midpoint = new NativeLibrary.PointZM
+                var midpoint = new HartNative.PointZM
                 {
                     X = (current.Geom!.Coordinate.X + next.Geom!.Coordinate.X) / 2,
                     Y = (current.Geom!.Coordinate.Y + next.Geom!.Coordinate.Y) / 2,
@@ -674,7 +674,7 @@ public class AIQueryService
 
         // Compute hash and Hilbert for new trajectory
         var centroid = newGeom.Centroid.Coordinate;
-        var hilbert = NativeLibrary.point_to_hilbert(new NativeLibrary.PointZM
+        var hilbert = HartNative.point_to_hilbert(new HartNative.PointZM
         {
             X = centroid.X,
             Y = centroid.Y,
@@ -689,7 +689,7 @@ public class AIQueryService
             HilbertHigh = (ulong)hilbert.High,
             HilbertLow = (ulong)hilbert.Low,
             Geom = newGeom,
-            ContentHash = NativeLibrary.ComputeCompositionHash(new[] { trajectoryCompositionId }, new[] { 1 }),
+            ContentHash = HartNative.ComputeCompositionHash(new[] { trajectoryCompositionId }, new[] { 1 }),
             TypeId = newTypeId
         };
 
@@ -861,7 +861,7 @@ public class AIQueryService
 
         // Compute hash and Hilbert
         var multiplicities = Enumerable.Repeat(1, componentConstantIds.Length).ToArray();
-        var contentHash = NativeLibrary.ComputeCompositionHash(componentConstantIds, multiplicities);
+        var contentHash = HartNative.ComputeCompositionHash(componentConstantIds, multiplicities);
 
         // Check if already exists
         var existing = await _context.Compositions
@@ -873,7 +873,7 @@ public class AIQueryService
             return existing;
 
         var centroid = geom.Centroid.Coordinate;
-        var hilbert = NativeLibrary.point_to_hilbert(new NativeLibrary.PointZM
+        var hilbert = HartNative.point_to_hilbert(new HartNative.PointZM
         {
             X = centroid.X,
             Y = centroid.Y,

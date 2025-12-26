@@ -2,9 +2,6 @@ using System.Runtime.InteropServices;
 using Hart.MCP.Core.Native;
 using Microsoft.Extensions.Logging;
 
-// Alias to avoid conflict with System.Runtime.InteropServices.NativeLibrary
-using HartNative = Hart.MCP.Core.Native.NativeLibrary;
-
 namespace Hart.MCP.Core.Services.Ingestion;
 
 /// <summary>
@@ -39,9 +36,43 @@ public class NativeBulkIngestionService : IDisposable
         string connectionString,
         ILogger<NativeBulkIngestionService>? logger = null)
     {
-        _connectionString = connectionString ?? throw new ArgumentNullException(nameof(connectionString));
+        // Convert Npgsql format to libpq format
+        // Npgsql: Host=localhost;Port=5432;Database=X;Username=Y;Password=Z
+        // libpq:  host=localhost port=5432 dbname=X user=Y password=Z
+        _connectionString = ConvertToLibpqFormat(connectionString ?? throw new ArgumentNullException(nameof(connectionString)));
         _logger = logger;
         _nativeConn = IntPtr.Zero;
+    }
+
+    private static string ConvertToLibpqFormat(string npgsqlConnStr)
+    {
+        var parts = npgsqlConnStr.Split(';', StringSplitOptions.RemoveEmptyEntries);
+        var libpqParts = new List<string>();
+
+        foreach (var part in parts)
+        {
+            var kv = part.Split('=', 2);
+            if (kv.Length != 2) continue;
+
+            var key = kv[0].Trim().ToLowerInvariant();
+            var value = kv[1].Trim();
+
+            // Map Npgsql keys to libpq keys - only keep the core connection params
+            string? libpqKey = key switch
+            {
+                "host" => "host",
+                "port" => "port",
+                "database" => "dbname",
+                "username" => "user",
+                "password" => "password",
+                _ => null // Skip all pooling and other Npgsql-specific options
+            };
+
+            if (libpqKey != null)
+                libpqParts.Add($"{libpqKey}={value}");
+        }
+
+        return string.Join(" ", libpqParts);
     }
 
     /// <summary>

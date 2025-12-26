@@ -19,7 +19,7 @@ namespace Hart.MCP.Tests;
 /// - Adjacent codepoints should be spatially close (locality)
 /// - SIMD and scalar paths produce identical results
 /// </summary>
-public class NativeLibraryTests
+public class HartNativeTests
 {
     private const double HypersphereRadius = 1.0;
     private const double Tolerance = 1e-10;
@@ -35,7 +35,7 @@ public class NativeLibraryTests
     {
         for (uint seed = 32; seed < 127; seed++)
         {
-            var point = NativeLibrary.project_seed_to_hypersphere(seed);
+            var point = HartNative.project_seed_to_hypersphere(seed);
             var radiusSquared = point.X * point.X + point.Y * point.Y + 
                                 point.Z * point.Z + point.M * point.M;
             
@@ -56,7 +56,7 @@ public class NativeLibraryTests
     [InlineData(0x10FFFF, "Max Unicode")]
     public void HypersphereConstraint_UnicodeRanges_ExactlyOnUnitSphere(uint seed, string description)
     {
-        var point = NativeLibrary.project_seed_to_hypersphere(seed);
+        var point = HartNative.project_seed_to_hypersphere(seed);
         var radiusSquared = point.X * point.X + point.Y * point.Y + 
                             point.Z * point.Z + point.M * point.M;
         
@@ -73,7 +73,7 @@ public class NativeLibraryTests
     [InlineData(0xFFFFu, "Invalid codepoint")]
     public void HypersphereConstraint_EdgeCases_StillOnUnitSphere(uint seed, string description)
     {
-        var point = NativeLibrary.project_seed_to_hypersphere(seed);
+        var point = HartNative.project_seed_to_hypersphere(seed);
         var radiusSquared = point.X * point.X + point.Y * point.Y + 
                             point.Z * point.Z + point.M * point.M;
         
@@ -96,9 +96,9 @@ public class NativeLibraryTests
     {
         const uint seed = 'A';
         
-        var point1 = NativeLibrary.project_seed_to_hypersphere(seed);
-        var point2 = NativeLibrary.project_seed_to_hypersphere(seed);
-        var point3 = NativeLibrary.project_seed_to_hypersphere(seed);
+        var point1 = HartNative.project_seed_to_hypersphere(seed);
+        var point2 = HartNative.project_seed_to_hypersphere(seed);
+        var point3 = HartNative.project_seed_to_hypersphere(seed);
         
         // Byte-identical means exact equality, not approximate
         point1.X.Should().Be(point2.X, because: "deterministic projection requires exact equality");
@@ -115,10 +115,10 @@ public class NativeLibraryTests
     [Fact]
     public void Determinism_SamePoint_IdenticalHilbertIndex()
     {
-        var point = new NativeLibrary.PointZM { X = 0.5, Y = 0.5, Z = 0.5, M = 0.5 };
+        var point = new HartNative.PointZM { X = 0.5, Y = 0.5, Z = 0.5, M = 0.5 };
         
-        var hilbert1 = NativeLibrary.point_to_hilbert(point);
-        var hilbert2 = NativeLibrary.point_to_hilbert(point);
+        var hilbert1 = HartNative.point_to_hilbert(point);
+        var hilbert2 = HartNative.point_to_hilbert(point);
         
         hilbert1.High.Should().Be(hilbert2.High, because: "Hilbert index must be deterministic");
         hilbert1.Low.Should().Be(hilbert2.Low);
@@ -129,9 +129,9 @@ public class NativeLibraryTests
     {
         const uint seed = 'A';
         
-        var hash1 = NativeLibrary.ComputeSeedHash(seed);
-        var hash2 = NativeLibrary.ComputeSeedHash(seed);
-        var hash3 = NativeLibrary.ComputeSeedHash(seed);
+        var hash1 = HartNative.ComputeSeedHash(seed);
+        var hash2 = HartNative.ComputeSeedHash(seed);
+        var hash3 = HartNative.ComputeSeedHash(seed);
         
         hash1.Should().Equal(hash2, because: "BLAKE3 must be deterministic");
         hash2.Should().Equal(hash3);
@@ -148,8 +148,8 @@ public class NativeLibraryTests
     [Fact]
     public void Uniqueness_AdjacentCodepoints_ProduceDifferentPoints()
     {
-        var pointA = NativeLibrary.project_seed_to_hypersphere('A');
-        var pointB = NativeLibrary.project_seed_to_hypersphere('B');
+        var pointA = HartNative.project_seed_to_hypersphere('A');
+        var pointB = HartNative.project_seed_to_hypersphere('B');
         
         var distance = Math.Sqrt(
             Math.Pow(pointA.X - pointB.X, 2) +
@@ -168,7 +168,7 @@ public class NativeLibraryTests
         
         for (uint seed = 32; seed < 127; seed++)
         {
-            var point = NativeLibrary.project_seed_to_hypersphere(seed);
+            var point = HartNative.project_seed_to_hypersphere(seed);
             var position = (point.X, point.Y, point.Z, point.M);
             
             // Check this position doesn't match any previous
@@ -191,11 +191,11 @@ public class NativeLibraryTests
     [Fact]
     public void Uniqueness_DifferentSeeds_DifferentHilbertIndices()
     {
-        var pointA = NativeLibrary.project_seed_to_hypersphere('A');
-        var pointB = NativeLibrary.project_seed_to_hypersphere('B');
+        var pointA = HartNative.project_seed_to_hypersphere('A');
+        var pointB = HartNative.project_seed_to_hypersphere('B');
         
-        var hilbertA = NativeLibrary.point_to_hilbert(pointA);
-        var hilbertB = NativeLibrary.point_to_hilbert(pointB);
+        var hilbertA = HartNative.point_to_hilbert(pointA);
+        var hilbertB = HartNative.point_to_hilbert(pointB);
         
         var sameIndex = hilbertA.High == hilbertB.High && hilbertA.Low == hilbertB.Low;
         sameIndex.Should().BeFalse(because: "different positions must have different Hilbert indices");
@@ -204,8 +204,8 @@ public class NativeLibraryTests
     [Fact]
     public void Uniqueness_DifferentSeeds_DifferentHashes()
     {
-        var hashA = NativeLibrary.ComputeSeedHash('A');
-        var hashB = NativeLibrary.ComputeSeedHash('B');
+        var hashA = HartNative.ComputeSeedHash('A');
+        var hashB = HartNative.ComputeSeedHash('B');
         
         hashA.Should().NotEqual(hashB, because: "BLAKE3 is collision-resistant");
     }
@@ -224,9 +224,9 @@ public class NativeLibraryTests
         // Max quantization error for 16 bits per dimension = 2 / 65535 ≈ 3e-5
         const double maxQuantizationError = 2.0 / 65535.0;
         
-        var originalPoint = NativeLibrary.project_seed_to_hypersphere('A');
-        var hilbert = NativeLibrary.point_to_hilbert(originalPoint);
-        var reconstructedPoint = NativeLibrary.hilbert_to_point(hilbert);
+        var originalPoint = HartNative.project_seed_to_hypersphere('A');
+        var hilbert = HartNative.point_to_hilbert(originalPoint);
+        var reconstructedPoint = HartNative.hilbert_to_point(hilbert);
         
         Math.Abs(originalPoint.X - reconstructedPoint.X).Should().BeLessThan(maxQuantizationError,
             because: "X coordinate must survive Hilbert roundtrip within quantization bounds");
@@ -243,9 +243,9 @@ public class NativeLibraryTests
         
         foreach (var seed in testSeeds)
         {
-            var original = NativeLibrary.project_seed_to_hypersphere(seed);
-            var hilbert = NativeLibrary.point_to_hilbert(original);
-            var reconstructed = NativeLibrary.hilbert_to_point(hilbert);
+            var original = HartNative.project_seed_to_hypersphere(seed);
+            var hilbert = HartNative.point_to_hilbert(original);
+            var reconstructed = HartNative.hilbert_to_point(hilbert);
             
             var maxError = Math.Max(
                 Math.Max(Math.Abs(original.X - reconstructed.X), Math.Abs(original.Y - reconstructed.Y)),
@@ -263,7 +263,7 @@ public class NativeLibraryTests
     [Fact]
     public void Hash_SeedHash_Returns32Bytes()
     {
-        var hash = NativeLibrary.ComputeSeedHash('A');
+        var hash = HartNative.ComputeSeedHash('A');
         
         hash.Should().HaveCount(32, because: "BLAKE3-256 always produces 32-byte hashes");
     }
@@ -275,8 +275,8 @@ public class NativeLibraryTests
         var multiplicities = new int[] { 1, 1 };
         var refsReversed = new long[] { 2, 1 };
         
-        var hash1 = NativeLibrary.ComputeCompositionHash(refs, multiplicities);
-        var hash2 = NativeLibrary.ComputeCompositionHash(refsReversed, multiplicities);
+        var hash1 = HartNative.ComputeCompositionHash(refs, multiplicities);
+        var hash2 = HartNative.ComputeCompositionHash(refsReversed, multiplicities);
         
         hash1.Should().NotEqual(hash2, 
             because: "order of children affects hash (compositions are ordered)");
@@ -289,8 +289,8 @@ public class NativeLibraryTests
         var mult1 = new int[] { 1 };
         var mult2 = new int[] { 2 };
         
-        var hash1 = NativeLibrary.ComputeCompositionHash(refs, mult1);
-        var hash2 = NativeLibrary.ComputeCompositionHash(refs, mult2);
+        var hash1 = HartNative.ComputeCompositionHash(refs, mult1);
+        var hash2 = HartNative.ComputeCompositionHash(refs, mult2);
         
         hash1.Should().NotEqual(hash2, 
             because: "multiplicity is part of the content identity");
@@ -303,7 +303,7 @@ public class NativeLibraryTests
     [Fact]
     public void SIMD_CapabilitiesDetection_ReturnsValidStruct()
     {
-        var caps = NativeLibrary.detect_simd_capabilities();
+        var caps = HartNative.detect_simd_capabilities();
         
         // At minimum, SSE2 should be available on any x64 CPU
         // (SSE2 is required for x64)
@@ -324,17 +324,17 @@ public class NativeLibraryTests
         
         for (int i = 0; i < count; i++)
         {
-            var point = NativeLibrary.project_seed_to_hypersphere((uint)('A' + i));
+            var point = HartNative.project_seed_to_hypersphere((uint)('A' + i));
             xs[i] = point.X;
             ys[i] = point.Y;
             zs[i] = point.Z;
             ms[i] = point.M;
         }
         
-        var queryPoint = NativeLibrary.project_seed_to_hypersphere('Q');
+        var queryPoint = HartNative.project_seed_to_hypersphere('Q');
         
         // Compute batch distances using SIMD
-        NativeLibrary.BatchComputeDistances(
+        HartNative.BatchComputeDistances(
             queryPoint.X, queryPoint.Y, queryPoint.Z, queryPoint.M,
             xs, ys, zs, ms, simdDistances);
         
@@ -359,7 +359,7 @@ public class NativeLibraryTests
         var distances = new double[] { 0.1, 0.2, 0.5, 1.0, 2.0 };
         var weights = new double[distances.Length];
         
-        NativeLibrary.ComputeAttentionWeights(distances, weights);
+        HartNative.ComputeAttentionWeights(distances, weights);
         
         var sum = weights.Sum();
         sum.Should().BeApproximately(1.0, 1e-10,
@@ -372,7 +372,7 @@ public class NativeLibraryTests
         var distances = new double[] { 0.1, 1.0 };
         var weights = new double[distances.Length];
         
-        NativeLibrary.ComputeAttentionWeights(distances, weights);
+        HartNative.ComputeAttentionWeights(distances, weights);
         
         weights[0].Should().BeGreaterThan(weights[1],
             because: "closer atoms (smaller distance) should receive higher attention weight");
@@ -387,7 +387,7 @@ public class NativeLibraryTests
         var zs = new double[] { 0.5, 0.5, 0.5, 0.5 };
         var ms = new double[] { 0.0, 0.0, 0.0, 0.0 };
         
-        var centroid = NativeLibrary.ComputeCentroid(xs, ys, zs, ms);
+        var centroid = HartNative.ComputeCentroid(xs, ys, zs, ms);
         
         centroid.X.Should().BeApproximately(0.5, 1e-10, because: "centroid X is average of X coords");
         centroid.Y.Should().BeApproximately(0.5, 1e-10, because: "centroid Y is average of Y coords");

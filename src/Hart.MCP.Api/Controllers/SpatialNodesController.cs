@@ -53,8 +53,8 @@ public class SpatialNodesController : ControllerBase
                 }
             }
 
-            var hilbert = Hart.MCP.Core.Native.NativeLibrary.point_to_hilbert(
-                new Hart.MCP.Core.Native.NativeLibrary.PointZM
+            var hilbert = Hart.MCP.Core.Native.HartNative.point_to_hilbert(
+                new Hart.MCP.Core.Native.HartNative.PointZM
                 {
                     X = request.X, Y = request.Y, Z = request.Z, M = request.M
                 });

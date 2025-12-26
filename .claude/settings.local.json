@@ -4,7 +4,18 @@
       "Bash(cd:*)",
       "Bash(dir:*)",
       "Bash(dotnet build:*)",
-      "Bash(dotnet test:*)"
+      "Bash(dotnet test:*)",
+      "Bash(cat:*)",
+      "Bash(cmake --build:*)",
+      "Bash(ls:*)",
+      "Bash(psql:*)",
+      "Bash(timeout:*)",
+      "Bash(powershell -Command:*)",
+      "Bash(curl:*)",
+      "Bash(xcopy \"D:\\\\PostgreSQL\\\\18\\\\bin\\\\libpq.dll\" \"D:\\\\Repositories\\\\Hart-MCP\\\\src\\\\Hart.MCP.Native\\\\lib\"\" /Y && xcopy \"D:PostgreSQL18binlibssl-3-x64.dll\" \"D:RepositoriesHart-MCPsrcHart.MCP.Nativelib\"\" /Y)",
+      "Bash(xcopy \"D:\\\\PostgreSQL\\\\18\\\\bin\\\\libcrypto-3-x64.dll\" \"D:\\\\Repositories\\\\Hart-MCP\\\\src\\\\Hart.MCP.Native\\\\lib\"\" /Y && xcopy \"D:PostgreSQL18binlibiconv-2.dll\" \"D:RepositoriesHart-MCPsrcHart.MCP.Nativelib\"\" /Y)",
+      "Bash(xcopy \"D:\\\\PostgreSQL\\\\18\\\\bin\\\\libintl-9.dll\" \"D:\\\\Repositories\\\\Hart-MCP\\\\src\\\\Hart.MCP.Native\\\\lib\"\" /Y)",
+      "Bash(dumpbin:*)"
     ]
   }
 }

@@ -238,7 +238,7 @@ public sealed class ParallelIngestionService : IAsyncDisposable
             while (i + count < codepoints.Count && codepoints[i + count] == cp)
                 count++;
             
-            var hash = Convert.ToHexString(NativeLibrary.ComputeSeedHash(cp));
+            var hash = Convert.ToHexString(HartNative.ComputeSeedHash(cp));
             hashes.Add(hash);
             multiplicities.Add(count);
             
@@ -257,7 +257,7 @@ public sealed class ParallelIngestionService : IAsyncDisposable
     {
         // Check cache first
         var uncached = codepoints
-            .Where(cp => !_hashCache.ContainsKey(Convert.ToHexString(NativeLibrary.ComputeSeedHash(cp))))
+            .Where(cp => !_hashCache.ContainsKey(Convert.ToHexString(HartNative.ComputeSeedHash(cp))))
             .ToList();
 
         if (uncached.Count == 0)
@@ -290,7 +290,7 @@ public sealed class ParallelIngestionService : IAsyncDisposable
         var hashToCodepoint = new Dictionary<string, uint>();
         foreach (var cp in codepoints)
         {
-            var hash = Convert.ToHexString(NativeLibrary.ComputeSeedHash(cp));
+            var hash = Convert.ToHexString(HartNative.ComputeSeedHash(cp));
             hashToCodepoint[hash] = cp;
         }
 
@@ -321,8 +321,8 @@ public sealed class ParallelIngestionService : IAsyncDisposable
         {
             foreach (var (hash, cp) in hashToCodepoint)
             {
-                var point = NativeLibrary.project_seed_to_hypersphere(cp);
-                var hilbert = NativeLibrary.point_to_hilbert(point);
+                var point = HartNative.project_seed_to_hypersphere(cp);
+                var hilbert = HartNative.point_to_hilbert(point);
                 var geom = _geometryFactory.CreatePoint(new CoordinateZM(point.X, point.Y, point.Z, point.M));
 
                 constantList.Add(new Constant
@@ -432,7 +432,7 @@ public sealed class ParallelIngestionService : IAsyncDisposable
         int[] multiplicities,
         CancellationToken cancellationToken)
     {
-        var contentHash = NativeLibrary.ComputeCompositionHash(childConstantIds, multiplicities);
+        var contentHash = HartNative.ComputeCompositionHash(childConstantIds, multiplicities);
         var hashHex = Convert.ToHexString(contentHash);
 
         // Check cache
@@ -471,7 +471,7 @@ public sealed class ParallelIngestionService : IAsyncDisposable
             : _geometryFactory.CreateLineString(coords);
 
         var centroid = geom.Centroid.Coordinate;
-        var hilbert = NativeLibrary.point_to_hilbert(new NativeLibrary.PointZM
+        var hilbert = HartNative.point_to_hilbert(new HartNative.PointZM
         {
             X = centroid.X,
             Y = centroid.Y,

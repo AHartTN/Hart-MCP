@@ -39,7 +39,7 @@ public class SpatialQueryService
         if (limit <= 0 || limit > 1000)
             throw new ArgumentOutOfRangeException(nameof(limit), "Limit must be between 1 and 1000");
 
-        var point = NativeLibrary.project_seed_to_hypersphere(seed);
+        var point = HartNative.project_seed_to_hypersphere(seed);
         var factory = new GeometryFactory(new PrecisionModel(), 0);
         var geom = factory.CreatePoint(new CoordinateZM(point.X, point.Y, point.Z, point.M));
 

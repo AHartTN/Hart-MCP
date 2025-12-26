@@ -1,5 +1,5 @@
 -- HART-MCP Database Schema
--- Single table stores EVERYTHING (text, embeddings, AI models, all content)
+-- Three tables: constant (leaf nodes), composition (internal nodes), relation (edges)
 
 -- Create database
 CREATE DATABASE "HART-MCP" WITH ENCODING 'UTF8';
@@ -9,112 +9,111 @@ CREATE DATABASE "HART-MCP" WITH ENCODING 'UTF8';
 -- Enable PostGIS
 CREATE EXTENSION IF NOT EXISTS postgis;
 
--- ONE TABLE TO RULE THEM ALL
-CREATE TABLE atom (
+-- =============================================================================
+-- CONSTANT TABLE - Irreducible atomic values (Unicode codepoints, bytes, floats)
+-- =============================================================================
+CREATE TABLE constant (
     id BIGSERIAL PRIMARY KEY,
-    
-    -- Hilbert index (4D space-filling curve for locality-preserving indexing)
+
+    -- Seed value for lossless reconstruction
+    seed_value BIGINT NOT NULL,      -- Unicode codepoint, integer, or float bits
+    seed_type INT NOT NULL,          -- 0=Unicode, 1=byte, 2=float32 bits, 3=integer
+
+    -- Content hash (BLAKE3-256, 32 bytes) for deduplication
+    content_hash BYTEA NOT NULL UNIQUE,
+
+    -- Hilbert index (128-bit space-filling curve for locality)
     hilbert_high BIGINT NOT NULL,
     hilbert_low BIGINT NOT NULL,
-    
-    -- Geometry (SRID 0 = abstract 4D hypersphere, not geographic)
-    -- Constants: POINTZM (single point on hypersphere surface)
-    -- Compositions: LINESTRING/POLYGON/GEOMETRYCOLLECTION
-    geom GEOMETRY(GEOMETRYZM, 0) NOT NULL,  
-    
-    -- Type flag
-    is_constant BOOLEAN NOT NULL,
-    
-    -- For constants: the original seed value for lossless reconstruction
-    seed_value BIGINT,           -- Unicode codepoint, integer, or float bits
-    seed_type INT,               -- 0=Unicode, 1=Integer, 2=Float bits
-    
-    -- Composition structure (NULL for constants)
-    refs BIGINT[],               -- Child atom IDs
-    multiplicities INT[],        -- Parallel array: RLE counts or edge weights
-    
-    -- Content hash (BLAKE3-256, 32 bytes)
-    -- Automatic deduplication: same content = same hash = same atom
-    content_hash BYTEA NOT NULL UNIQUE,
-    
-    -- Type discriminator for app-layer entity mapping
-    -- e.g., 'char', 'word', 'sentence', 'embedding', 'ai_model', 'conversation', 'turn'
-    atom_type VARCHAR(64),
-    
-    -- JSONB metadata for app-layer data (flexible schema per AtomType)
-    -- e.g., for ai_model: {"name": "GPT-4", "architecture": "transformer", "parameterCount": 1760000000}
-    -- e.g., for conversation: {"sessionType": "chat", "userId": "user123"}
-    metadata JSONB,
-    
-    -- Constraints
-    CONSTRAINT atom_constant_check CHECK (
-        (is_constant = TRUE AND refs IS NULL AND multiplicities IS NULL) OR
-        (is_constant = FALSE AND refs IS NOT NULL AND multiplicities IS NOT NULL)
-    ),
-    CONSTRAINT atom_refs_mult_length CHECK (
-        refs IS NULL OR array_length(refs, 1) = array_length(multiplicities, 1)
-    ),
-    CONSTRAINT atom_seed_check CHECK (
-        (is_constant = TRUE) OR (seed_value IS NULL AND seed_type IS NULL)
-    )
+
+    -- 4D hypersphere geometry (POINTZM)
+    -- Coordinates derived deterministically from seed_value
+    geom GEOMETRY(POINTZM, 0) NOT NULL
 );
 
--- Indexes
-CREATE INDEX idx_atom_geom ON atom USING GIST (geom);  -- Spatial queries
-CREATE INDEX idx_atom_hilbert ON atom (hilbert_high, hilbert_low);  -- Range queries
-CREATE INDEX idx_atom_hash ON atom USING HASH (content_hash);  -- O(1) dedup lookup
-CREATE INDEX idx_atom_refs ON atom USING GIN (refs);  -- Fast traversal
-CREATE INDEX idx_atom_is_constant ON atom (is_constant);
-CREATE INDEX idx_atom_type ON atom (atom_type) WHERE atom_type IS NOT NULL;
-CREATE INDEX idx_atom_seed_value ON atom (seed_value) WHERE seed_value IS NOT NULL;
-CREATE INDEX idx_atom_metadata ON atom USING GIN (metadata);  -- JSONB queries
+-- Indexes for constant
+CREATE INDEX idx_constant_hash ON constant USING HASH (content_hash);
+CREATE INDEX idx_constant_seed ON constant (seed_type, seed_value);
+CREATE INDEX idx_constant_hilbert ON constant (hilbert_high, hilbert_low);
+CREATE INDEX idx_constant_geom ON constant USING GIST (geom);
 
--- Optional: CPE vocabulary management
-CREATE TABLE cpe_vocabulary (
+-- =============================================================================
+-- COMPOSITION TABLE - Composite nodes referencing other nodes
+-- =============================================================================
+CREATE TABLE composition (
     id BIGSERIAL PRIMARY KEY,
-    name TEXT NOT NULL,
-    version TEXT,
-    vocab_size INT,
-    min_frequency INT,
-    merge_order BIGINT[][],  -- Array of [atom_a_id, atom_b_id] pairs
-    created_at TIMESTAMPTZ DEFAULT NOW()
+
+    -- Content hash (BLAKE3-256) for deduplication
+    -- Computed from ordered child references
+    content_hash BYTEA NOT NULL UNIQUE,
+
+    -- Hilbert index
+    hilbert_high BIGINT NOT NULL,
+    hilbert_low BIGINT NOT NULL,
+
+    -- 4D geometry (centroid of children, or trajectory)
+    geom GEOMETRY(GEOMETRYZM, 0),
+
+    -- Optional type reference (for typed compositions)
+    type_id BIGINT REFERENCES composition(id) ON DELETE SET NULL
 );
 
--- Optional: Metadata tags (for human organization, not required)
-CREATE TABLE atom_tag (
-    atom_id BIGINT REFERENCES atom(id) ON DELETE CASCADE,
-    tag TEXT NOT NULL,
-    value TEXT,
-    PRIMARY KEY (atom_id, tag)
+-- Indexes for composition
+CREATE INDEX idx_composition_hash ON composition USING HASH (content_hash);
+CREATE INDEX idx_composition_hilbert ON composition (hilbert_high, hilbert_low);
+CREATE INDEX idx_composition_geom ON composition USING GIST (geom);
+CREATE INDEX idx_composition_type ON composition (type_id) WHERE type_id IS NOT NULL;
+
+-- =============================================================================
+-- RELATION TABLE - Edges linking compositions to their children
+-- =============================================================================
+CREATE TABLE relation (
+    id BIGSERIAL PRIMARY KEY,
+
+    -- Parent composition
+    composition_id BIGINT NOT NULL REFERENCES composition(id) ON DELETE CASCADE,
+
+    -- Child node (exactly one must be set)
+    child_constant_id BIGINT REFERENCES constant(id) ON DELETE CASCADE,
+    child_composition_id BIGINT REFERENCES composition(id) ON DELETE CASCADE,
+
+    -- Order within parent (0-indexed)
+    position INT NOT NULL,
+
+    -- RLE multiplicity (default 1)
+    multiplicity INT NOT NULL DEFAULT 1,
+
+    -- Constraints
+    CONSTRAINT relation_exactly_one_child CHECK (
+        (child_constant_id IS NOT NULL AND child_composition_id IS NULL) OR
+        (child_constant_id IS NULL AND child_composition_id IS NOT NULL)
+    ),
+    CONSTRAINT relation_positive_multiplicity CHECK (multiplicity > 0)
 );
 
-CREATE INDEX idx_atom_tag_tag ON atom_tag (tag);
+-- Indexes for relation
+CREATE INDEX idx_relation_composition ON relation (composition_id);
+CREATE INDEX idx_relation_child_constant ON relation (child_constant_id) WHERE child_constant_id IS NOT NULL;
+CREATE INDEX idx_relation_child_composition ON relation (child_composition_id) WHERE child_composition_id IS NOT NULL;
+CREATE UNIQUE INDEX idx_relation_position ON relation (composition_id, position);
 
--- Views for convenience
-
--- Constants only
-CREATE VIEW constant_atoms AS
-SELECT id, hilbert_high, hilbert_low, geom, content_hash, created_at
-FROM atom
-WHERE is_constant = TRUE;
-
--- Compositions only
-CREATE VIEW composition_atoms AS
-SELECT id, hilbert_high, hilbert_low, geom, refs, multiplicities, content_hash, created_at
-FROM atom
-WHERE is_constant = FALSE;
+-- =============================================================================
+-- VIEWS
+-- =============================================================================
 
 -- Statistics view
-CREATE VIEW atom_stats AS
+CREATE VIEW schema_stats AS
 SELECT
-    COUNT(*) AS total_atoms,
-    COUNT(*) FILTER (WHERE is_constant) AS constant_count,
-    COUNT(*) FILTER (WHERE NOT is_constant) AS composition_count,
-    COUNT(DISTINCT content_hash) AS unique_hashes,
-    pg_size_pretty(pg_total_relation_size('atom')) AS table_size
-FROM atom;
+    (SELECT COUNT(*) FROM constant) AS constant_count,
+    (SELECT COUNT(*) FROM composition) AS composition_count,
+    (SELECT COUNT(*) FROM relation) AS relation_count,
+    (SELECT pg_size_pretty(pg_total_relation_size('constant'))) AS constant_size,
+    (SELECT pg_size_pretty(pg_total_relation_size('composition'))) AS composition_size,
+    (SELECT pg_size_pretty(pg_total_relation_size('relation'))) AS relation_size;
 
--- Grant permissions (adjust as needed)
-GRANT ALL PRIVILEGES ON DATABASE "HART-MCP" TO postgres;
-GRANT ALL PRIVILEGES ON ALL TABLES IN SCHEMA public TO postgres;
-GRANT ALL PRIVILEGES ON ALL SEQUENCES IN SCHEMA public TO postgres;
+-- =============================================================================
+-- PERMISSIONS
+-- =============================================================================
+GRANT ALL PRIVILEGES ON DATABASE "HART-MCP" TO hartonomous;
+GRANT ALL PRIVILEGES ON ALL TABLES IN SCHEMA public TO hartonomous;
+GRANT ALL PRIVILEGES ON ALL SEQUENCES IN SCHEMA public TO hartonomous;

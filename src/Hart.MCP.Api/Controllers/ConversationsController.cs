@@ -44,14 +44,14 @@ public class ConversationsController : ControllerBase
 
             // Create conversation composition at origin (will be updated as turns accumulate)
             var geom = _geometryFactory.CreatePoint(new CoordinateZM(0, 0, 0, 0));
-            var hilbert = NativeLibrary.point_to_hilbert(new NativeLibrary.PointZM { X = 0, Y = 0, Z = 0, M = 0 });
+            var hilbert = HartNative.point_to_hilbert(new HartNative.PointZM { X = 0, Y = 0, Z = 0, M = 0 });
 
             var conversationComposition = new Composition
             {
                 HilbertHigh = (ulong)hilbert.High,
                 HilbertLow = (ulong)hilbert.Low,
                 Geom = geom,
-                ContentHash = NativeLibrary.ComputeCompositionHash(Array.Empty<long>(), Array.Empty<int>())
+                ContentHash = HartNative.ComputeCompositionHash(Array.Empty<long>(), Array.Empty<int>())
             };
 
             _context.Compositions.Add(conversationComposition);
@@ -109,7 +109,7 @@ public class ConversationsController : ControllerBase
             });
 
             var turnGeom = _geometryFactory.CreatePoint(coord);
-            var hilbert = NativeLibrary.point_to_hilbert(new NativeLibrary.PointZM
+            var hilbert = HartNative.point_to_hilbert(new HartNative.PointZM
             {
                 X = coord.X, Y = coord.Y, Z = coord.Z, M = coord.M
             });
@@ -119,7 +119,7 @@ public class ConversationsController : ControllerBase
                 HilbertHigh = (ulong)hilbert.High,
                 HilbertLow = (ulong)hilbert.Low,
                 Geom = turnGeom,
-                ContentHash = NativeLibrary.ComputeCompositionHash(new[] { sessionId, turnCount + 1 }, new[] { 1, 1 })
+                ContentHash = HartNative.ComputeCompositionHash(new[] { sessionId, turnCount + 1 }, new[] { 1, 1 })
             };
 
             _context.Compositions.Add(turnComposition);

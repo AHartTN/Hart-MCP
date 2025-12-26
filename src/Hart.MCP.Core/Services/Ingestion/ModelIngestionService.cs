@@ -9,8 +9,6 @@ using Microsoft.Extensions.Logging;
 using NetTopologySuite.Geometries;
 // Models defined in SafeTensorModels.cs (same namespace)
 
-// Alias to avoid ambiguity with System.Runtime.InteropServices.NativeLibrary
-using HartNative = Hart.MCP.Core.Native.NativeLibrary;
 
 namespace Hart.MCP.Core.Services.Ingestion;
 
@@ -332,9 +330,9 @@ public class ModelIngestionService : IngestionServiceBase
         // Bulk create missing
         var newConstants = missing.AsParallel().Select(cp =>
         {
-            var hash = Native.NativeLibrary.ComputeSeedHash(cp);
-            var point = Native.NativeLibrary.project_seed_to_hypersphere(cp);
-            var hilbert = Native.NativeLibrary.point_to_hilbert(point);
+            var hash = Native.HartNative.ComputeSeedHash(cp);
+            var point = Native.HartNative.project_seed_to_hypersphere(cp);
+            var hilbert = Native.HartNative.point_to_hilbert(point);
             var geom = GeometryFactory.CreatePoint(new CoordinateZM(point.X, point.Y, point.Z, point.M));
 
             return (cp, new Constant
@@ -386,9 +384,9 @@ public class ModelIngestionService : IngestionServiceBase
 
         var newConstants = missing.AsParallel().Select(val =>
         {
-            var hash = Native.NativeLibrary.ComputeSeedHash(val);
-            var point = Native.NativeLibrary.project_seed_to_hypersphere(val);
-            var hilbert = Native.NativeLibrary.point_to_hilbert(point);
+            var hash = Native.HartNative.ComputeSeedHash(val);
+            var point = Native.HartNative.project_seed_to_hypersphere(val);
+            var hilbert = Native.HartNative.point_to_hilbert(point);
             var geom = GeometryFactory.CreatePoint(new CoordinateZM(point.X, point.Y, point.Z, point.M));
 
             return (val, new Constant
@@ -458,7 +456,7 @@ public class ModelIngestionService : IngestionServiceBase
             var codepoints = textCodepoints[text];
             var constantIds = codepoints.Select(cp => cpToConstantId[cp]).ToArray();
             var mults = Enumerable.Repeat(1, constantIds.Length).ToArray();
-            var hash = Native.NativeLibrary.ComputeCompositionHash(constantIds, mults);
+            var hash = Native.HartNative.ComputeCompositionHash(constantIds, mults);
             textToHash[text] = hash;
         }
 
@@ -506,8 +504,8 @@ public class ModelIngestionService : IngestionServiceBase
 
             // Compute geometry from first char
             var firstCp = codepoints.FirstOrDefault();
-            var point = Native.NativeLibrary.project_seed_to_hypersphere(firstCp);
-            var hilbert = Native.NativeLibrary.point_to_hilbert(point);
+            var point = Native.HartNative.project_seed_to_hypersphere(firstCp);
+            var hilbert = Native.HartNative.point_to_hilbert(point);
             var geom = GeometryFactory.CreatePoint(new CoordinateZM(point.X, point.Y, point.Z, point.M));
 
             newCompositions.Add((text, new Composition

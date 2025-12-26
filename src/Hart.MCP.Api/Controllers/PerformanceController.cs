@@ -38,7 +38,7 @@ public class PerformanceController : ControllerBase
     {
         try
         {
-            var simdCaps = NativeLibrary.detect_simd_capabilities();
+            var simdCaps = HartNative.detect_simd_capabilities();
             
             return Ok(new CapabilitiesResponse
             {
@@ -52,7 +52,7 @@ public class PerformanceController : ControllerBase
                     AVX = simdCaps.HasAvx != 0,
                     AVX2 = simdCaps.HasAvx2 != 0,
                     AVX512 = simdCaps.HasAvx512F != 0,
-                    Description = NativeLibrary.GetSIMDCapabilities()
+                    Description = HartNative.GetSIMDCapabilities()
                 },
                 VectorHardwareAccelerated = System.Numerics.Vector.IsHardwareAccelerated,
                 VectorSize = System.Numerics.Vector<double>.Count,
@@ -302,7 +302,7 @@ public class PerformanceController : ControllerBase
         }
         
         response.ProcessorCount = Environment.ProcessorCount;
-        response.SIMDInfo = NativeLibrary.GetSIMDCapabilities();
+        response.SIMDInfo = HartNative.GetSIMDCapabilities();
         
         return Ok(response);
     }

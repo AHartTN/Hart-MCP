@@ -573,9 +573,9 @@ public class JsonIngestionService : IngestionServiceBase, IIngestionService<Json
             
             foreach (var val in missingValues)
             {
-                var contentHash = NativeLibrary.ComputeSeedHash(val);
-                var point = NativeLibrary.project_seed_to_hypersphere(val);
-                var hilbert = NativeLibrary.point_to_hilbert(point);
+                var contentHash = HartNative.ComputeSeedHash(val);
+                var point = HartNative.project_seed_to_hypersphere(val);
+                var hilbert = HartNative.point_to_hilbert(point);
                 var geom = GeometryFactory.CreatePoint(new CoordinateZM(point.X, point.Y, point.Z, point.M));
 
                 var constant = new Constant
